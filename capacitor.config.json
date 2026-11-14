@@ -1,0 +1,8 @@
+{
+  "appId": "app.rally.tabletennis",
+  "appName": "Rally",
+  "webDir": "www",
+  "backgroundColor": "#f2f5f9",
+  "android": { "allowMixedContent": false },
+  "ios": { "contentInset": "never" }
+}

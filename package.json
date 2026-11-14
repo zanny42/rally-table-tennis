@@ -1,0 +1,19 @@
+{
+  "name": "rally-table-tennis",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Rally: table tennis scorer with match history and a shared Elo ladder.",
+  "scripts": {
+    "test": "node --test --test-force-exit tests/",
+    "config": "node scripts/write-config.mjs"
+  },
+  "dependencies": {
+    "@capacitor/android": "7.6.9",
+    "@capacitor/core": "7.6.9",
+    "@capacitor/ios": "7.6.9"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "7.6.9",
+    "jsdom": "27.4.0"
+  }
+}
