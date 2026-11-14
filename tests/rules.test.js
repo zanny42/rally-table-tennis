@@ -72,6 +72,23 @@ test("Elo: names are matched case-insensitively and an upset earns more", () => 
   assert.deepEqual(R.streakOf(players.find(p => p.key === "theo").res), { win: true, n: 1 });
 });
 
+test("applyPoint moves to the next game and ends the match like the server", () => {
+  let g = [""];
+  for (let i = 0; i < 11; i++) g = R.applyPoint(g, 0, 3, 11).games;
+  assert.deepEqual(g, ["0".repeat(11), ""]);
+  let r;
+  for (let i = 0; i < 11; i++) { r = R.applyPoint(g, 0, 3, 11); g = r.games; }
+  assert.equal(r.done, true);
+  assert.deepEqual(g, ["0".repeat(11), "0".repeat(11)]);
+});
+
+test("undoPoint steps back across a game boundary", () => {
+  assert.deepEqual(R.undoPoint(["0".repeat(11), ""]), ["0".repeat(10)]);
+  assert.deepEqual(R.undoPoint(["01"]), ["0"]);
+  assert.deepEqual(R.undoPoint([""]), [""]);
+  assert.equal(R.initials("maya okafor"), "MO");
+});
+
 test("validRecord accepts a real result and rejects tampered ones", () => {
   const good = rec("m1", "Maya", "Theo", 0, 5);
   assert.equal(R.validRecord(good), true);

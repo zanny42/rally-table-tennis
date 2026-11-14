@@ -84,7 +84,31 @@
     } catch (e) { return false; }
   }
 
-  const api = { keyOf, gameScore, gameOver, serverAt, summarize, switchCount, stats, fromRecord, computeBoard, streakOf, validRecord };
+  /* Live matches store each game as a string of point winners ("0" or "1"), with an empty string
+     for a game not started yet. These mirror the score_point / undo_point database functions. */
+  const toMatch = (games, bestOf, target, firstServer) => ({ bestOf, target, firstServer: firstServer || 0, games: (games.length ? games : [""]).map(s => [...s].map(Number)) });
+
+  function applyPoint(games, p, bestOf, target) {
+    const g = games.length ? games.slice() : [""];
+    g[g.length - 1] += String(p);
+    const s = summarize(toMatch(g, bestOf, target));
+    if (s.over) return { games: g, done: true };
+    const [a, b] = gameScore([...g[g.length - 1]].map(Number));
+    if (gameOver(a, b, target)) g.push("");
+    return { games: g, done: false };
+  }
+
+  function undoPoint(games) {
+    const g = games.length ? games.slice() : [""];
+    if (g.length > 1 && g[g.length - 1] === "") g.pop();
+    if (g[g.length - 1] === "") return g;
+    g[g.length - 1] = g[g.length - 1].slice(0, -1);
+    return g;
+  }
+
+  const initials = n => String(n || "?").trim().split(/\s+/).map(w => w[0] || "").slice(0, 2).join("").toUpperCase() || "?";
+
+  const api = { keyOf, gameScore, gameOver, serverAt, summarize, switchCount, stats, fromRecord, computeBoard, streakOf, validRecord, toMatch, applyPoint, undoPoint, initials };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
   else root.RallyRules = api;
 })(typeof window !== "undefined" ? window : globalThis);

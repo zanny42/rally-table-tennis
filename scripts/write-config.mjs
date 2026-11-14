@@ -1,8 +1,10 @@
-// Writes www/config.js from environment variables at build time.
-// SUPABASE_URL and SUPABASE_ANON_KEY come from GitHub Actions secrets.
-// The anon key is a publishable key; access is limited by the row-level security in supabase/schema.sql.
-// With neither set, the app runs in "this phone only" mode.
-import { writeFileSync } from "node:fs";
+// Prepares www/ for a build:
+// 1. writes www/config.js from SUPABASE_URL and SUPABASE_ANON_KEY (GitHub Actions secrets),
+// 2. copies the Supabase browser client into www/vendor/ so the app works without a CDN.
+// The anon key is a publishable key; row-level security in supabase/ limits what it can do.
+import { writeFileSync, mkdirSync, copyFileSync, existsSync } from "node:fs";
+import { createRequire } from "node:module";
+import { dirname, join } from "node:path";
 
 const url = (process.env.SUPABASE_URL || "").trim();
 const key = (process.env.SUPABASE_ANON_KEY || "").trim();
@@ -10,6 +12,14 @@ if (url && !/^https:\/\/[a-z0-9-]+\.supabase\.co\/?$/i.test(url)) {
   console.error("SUPABASE_URL should look like https://<project>.supabase.co");
   process.exit(1);
 }
-const cfg = { supabaseUrl: url.replace(/\/$/, ""), supabaseAnonKey: key };
-writeFileSync(new URL("../www/config.js", import.meta.url), "window.RALLY_CONFIG = " + JSON.stringify(cfg) + ";\n");
-console.log(url && key ? "Config written: shared ladder enabled." : "Config written: no Supabase secrets, app keeps matches on each phone.");
+const www = new URL("../www/", import.meta.url);
+writeFileSync(new URL("config.js", www), "window.RALLY_CONFIG = " + JSON.stringify({ supabaseUrl: url.replace(/\/$/, ""), supabaseAnonKey: key }) + ";\n");
+
+const require = createRequire(import.meta.url);
+const pkgDir = dirname(require.resolve("@supabase/supabase-js/package.json"));
+const umd = join(pkgDir, "dist", "umd", "supabase.js");
+if (!existsSync(umd)) { console.error("Supabase browser build not found at " + umd); process.exit(1); }
+mkdirSync(new URL("vendor/", www), { recursive: true });
+copyFileSync(umd, new URL("vendor/supabase.js", www));
+
+console.log(url && key ? "Config written: club server enabled." : "Config written: no Supabase secrets, guest mode only.");

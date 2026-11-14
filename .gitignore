@@ -5,3 +5,4 @@ www/config.js
 *.apk
 *.ipa
 .DS_Store
+www/vendor/

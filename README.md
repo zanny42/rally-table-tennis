@@ -1,6 +1,6 @@
 # Rally
 
-A table tennis scorer for phones: live point-by-point scoring with serve, deuce and change-of-ends calls, saved score sheets, and a shared Elo ladder.
+A table tennis scorer for phones. Sign in, start a match, and keep score together on several phones in real time. Finished matches land on a shared Elo ladder. Guests can still score on one phone without an account.
 
 Built with [Capacitor](https://capacitorjs.com) from the plain web app in `www/`. GitHub Actions runs the tests and builds both phone apps on every push to `main`.
 
@@ -12,6 +12,12 @@ Open the repo's **Releases** page, then the release called **latest**:
 - **Rally.ipa** (iPhone): it's unsigned. On a computer, install [Sideloadly](https://sideloadly.io) or [AltStore](https://altstore.io), connect your iPhone, and sideload the file with your Apple ID. With a free Apple ID the app has to be re-signed every 7 days.
 
 The same files are attached to each run on the **Actions** tab.
+
+## Club server (Supabase)
+
+The club server is set up with `supabase/schema.sql` (the ladder) and `supabase/rally2.sql` (accounts, live matches, scoring). Run both in the Supabase SQL Editor for a new project.
+
+New accounts must confirm their email before they can sign in. The confirmation link opens in a browser and may land on a page that doesn't load; the account is confirmed anyway, so go back to the app and sign in. To skip confirmation for a private club, turn off **Authentication → Sign In / Providers → Email → Confirm email** in Supabase.
 
 ## Turn on the shared ladder
 
