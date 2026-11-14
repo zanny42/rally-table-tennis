@@ -1,0 +1,117 @@
+name: Test and build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm test
+
+  android:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - run: npm ci
+      - name: Write app config
+        run: npm run config
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+      - name: Add Android platform
+        run: |
+          npx cap add android
+          npx cap sync android
+      - name: Build APK
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug --no-daemon
+          cp app/build/outputs/apk/debug/app-debug.apk "$GITHUB_WORKSPACE/Rally.apk"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Rally-android
+          path: Rally.apk
+          if-no-files-found: error
+
+  ios:
+    needs: test
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Write app config
+        run: npm run config
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
+      - name: Add iOS platform
+        run: |
+          npx cap add ios
+          npx cap sync ios
+      - name: Build unsigned IPA
+        run: |
+          if [ -d ios/App/App.xcworkspace ]; then SRC="-workspace ios/App/App.xcworkspace"; else SRC="-project ios/App/App.xcodeproj"; fi
+          xcodebuild $SRC -scheme App -configuration Release -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/App.xcarchive" archive \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" | tail -40
+          test -d "$RUNNER_TEMP/App.xcarchive/Products/Applications/App.app"
+          mkdir -p Payload
+          cp -R "$RUNNER_TEMP/App.xcarchive/Products/Applications/App.app" Payload/
+          zip -qry Rally.ipa Payload
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Rally-ios-unsigned
+          path: Rally.ipa
+          if-no-files-found: error
+
+  release:
+    if: github.event_name != 'pull_request'
+    needs: [android, ios]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - name: Publish the latest build as a GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release delete latest --yes --cleanup-tag || true
+          gh release create latest Rally.apk Rally.ipa --target "$GITHUB_SHA" --prerelease \
+            --title "Rally latest build" \
+            --notes "Built from ${GITHUB_SHA::7}. Rally.apk installs on Android. Rally.ipa is unsigned: install it with Sideloadly or AltStore, which sign it with your Apple ID."
