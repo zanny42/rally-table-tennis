@@ -32,4 +32,5 @@ create policy "delete own matches" on public.matches
   for delete to anon
   using (by = coalesce(current_setting('request.headers', true)::json->>'x-device-id', ''));
 
+revoke update, truncate, references, trigger on public.matches from anon, authenticated;
 grant select, insert, delete on public.matches to anon;
