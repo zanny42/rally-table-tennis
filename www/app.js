@@ -40,7 +40,8 @@ const sb = (CFG.supabaseUrl && CFG.supabaseAnonKey && window.supabase && window.
 const S = {
   session: null, me: null, guest: LS.get("rally.guest", false),
   profiles: [], ladder: LS.get("rally.ladderCache", []), live: [], local: LS.get("rally.local", []),
-  joined: new Set(LS.get("rally.joined", [])),
+  joined: new Set(LS.get("rally.joined", [])), tkeep: new Set(LS.get("rally.tkeep", [])),
+  tournaments: [], tour: null, tdraft: null,
   game: null, screen: null, report: null, draft: null, bump: null,
   pending: 0, booted: !sb, authMode: "signin", lastView: "", net: sb ? "loading" : "offline"
 };
@@ -52,7 +53,8 @@ function fromRow(r) {
     id: r.id, remote: true, a: r.a_name, b: r.b_name, aUser: r.a_user || null, bUser: r.b_user || null,
     bestOf: r.best_of, target: r.target, firstServer: r.first_server, keepers: r.keepers, code: r.join_code,
     games: r.games && r.games.length ? r.games.slice() : [""], status: r.status, version: r.version || 0, owner: r.owner,
-    startedAt: Date.parse(r.started_at) || Date.now(), endedAt: r.ended_at ? Date.parse(r.ended_at) : null, flip: 0
+    startedAt: Date.parse(r.started_at) || Date.now(), endedAt: r.ended_at ? Date.parse(r.ended_at) : null, flip: 0,
+    tournamentId: r.tournament_id || null, round: r.round == null ? null : r.round, slot: r.slot == null ? null : r.slot, aTp: r.a_tp || null, bTp: r.b_tp || null
   };
 }
 function toRecord(g) {
@@ -64,11 +66,18 @@ const finished = () => S.ladder.concat(S.local.map(m => Object.assign({ local: t
 function canScore(g) {
   if (!g.remote) return true;
   const me = uid(); if (!me) return false;
+  if (g.keepers === "tournament" && g.tournamentId && isTKeeper(g.tournamentId)) return true;
   return g.owner === me || g.keepers === "club" || (g.keepers === "players" && (g.aUser === me || g.bUser === me)) || S.joined.has(g.id);
+}
+function isTKeeper(tid) {
+  if (!uid()) return false;
+  const t = (S.tour && S.tour.t.id === tid) ? S.tour.t : S.tournaments.find(x => x.id === tid);
+  return (t && t.owner === uid()) || S.tkeep.has(tid);
 }
 function keepersText(g) {
   if (!g.remote) return "On this phone";
   if (!canScore(g)) return "Watching";
+  if (g.keepers === "tournament") return "Tournament scorekeepers";
   return { owner: "Only the host is scoring", players: "Both players scoring", club: "Anyone in the club can score" }[g.keepers] || "Scoring";
 }
 
@@ -92,7 +101,21 @@ async function loadProfiles() {
 let channel = null;
 function subscribe() {
   if (!sb || channel || !uid()) return;
-  channel = sb.channel("rally-live").on("postgres_changes", { event: "*", schema: "public", table: "live_matches" }, onLiveChange).subscribe();
+  channel = sb.channel("rally-live")
+    .on("postgres_changes", { event: "*", schema: "public", table: "live_matches" }, onLiveChange)
+    .on("postgres_changes", { event: "*", schema: "public", table: "tournaments" }, onTourChange)
+    .on("postgres_changes", { event: "*", schema: "public", table: "tournament_players" }, onTourChange)
+    .subscribe();
+}
+let tourT = null;
+function onTourChange(p) {
+  const tid = (p.new && (p.new.tournament_id || (p.new.mode && p.new.id))) || (p.old && (p.old.tournament_id || p.old.id));
+  clearTimeout(tourT);
+  tourT = setTimeout(async () => {
+    await loadTournaments();
+    if (S.tour && (!tid || S.tour.t.id === tid)) await loadTour(S.tour.t.id);
+    render(true);
+  }, 300);
 }
 function onLiveChange(p) {
   if (p.eventType === "DELETE") {
@@ -112,6 +135,11 @@ function onLiveChange(p) {
     if (after > before) { const last = row.games.filter(x => x).pop(); S.bump = { p: +last.slice(-1), n: Date.now() }; }
   }
   if (row.status === "done") loadLadder().then(() => render(true));
+  if (row.tournamentId && S.tour && S.tour.t.id === row.tournamentId) {
+    const i = S.tour.matches.findIndex(m => m.id === row.id);
+    if (i >= 0) S.tour.matches[i] = row; else S.tour.matches.push(row);
+    if (row.status === "done") afterTourMatch(row.tournamentId);
+  }
   render(true);
 }
 
@@ -125,7 +153,7 @@ async function initAuth() {
 async function afterAuth() {
   if (uid()) {
     S.guest = false; LS.set("rally.guest", false);
-    await Promise.all([loadProfiles(), loadLadder(), loadLive()]);
+    await Promise.all([loadProfiles(), loadLadder(), loadLive(), loadTournaments()]);
     subscribe();
   } else {
     if (channel) { try { sb.removeChannel(channel); } catch (e) {} channel = null; }
@@ -168,7 +196,7 @@ const av = (name, cls) => `<span class="av ${cls || ""}">${esc(R.initials(name))
 function weekStart() { const d = new Date(); const day = (d.getDay() + 6) % 7; return new Date(d.getFullYear(), d.getMonth(), d.getDate() - day); }
 
 /* ---------- views ---------- */
-const TABS = ["home", "ladder", "sheets", "you"];
+const TABS = ["home", "ladder", "cups", "sheets", "you"];
 const route = () => { const h = (location.hash || "").slice(1); return TABS.includes(h) ? h : "home"; };
 let timerT = null;
 
@@ -180,6 +208,8 @@ function render(keep) {
   else if (S.game) view = "game";
   else if (S.screen === "new") view = "new";
   else if (S.screen === "report" && S.report) view = "report";
+  else if (S.screen === "tnew") view = "tnew";
+  else if (S.screen === "tour" && S.tour) view = "tour";
   else view = route();
   app.classList.toggle("still", view === S.lastView || keep === true && view === S.lastView);
   if (view !== S.lastView) window.scrollTo(0, 0);
@@ -190,7 +220,7 @@ function render(keep) {
   document.querySelectorAll(".tabbar a").forEach(a => { if (a.dataset.tab === view) a.setAttribute("aria-current", "page"); else a.removeAttribute("aria-current"); });
   $("#glow").className = "glow " + (view === "auth" || view === "report" ? "big" : "tr");
   clearInterval(timerT);
-  const V = { loading: vLoading, auth: vAuth, home: vHome, ladder: vLadder, sheets: vSheets, you: vYou, new: vNew, game: vGame, report: vReport }[view];
+  const V = { loading: vLoading, auth: vAuth, home: vHome, ladder: vLadder, sheets: vSheets, you: vYou, new: vNew, game: vGame, report: vReport, cups: vCups, tnew: vTourNew, tour: vTour }[view];
   V(app);
 }
 
@@ -389,6 +419,7 @@ function vGame(app) {
   ${s.over ? `<div class="overlay"><span class="glow big" style="position:absolute"></span><span style="font-size:14px;color:var(--accent-ink);font-weight:600">Match over</span>
     <h2>${esc(name(s.winner))} wins ${Math.max(...s.gw)}–${Math.min(...s.gw)}</h2>
     <button class="btn" id="reportBtn">See the match report</button>
+    ${g.tournamentId ? `<button class="btn ghost" id="toTour">Back to the tournament</button>` : ""}
     ${canUndo ? `<button class="btn ghost" id="overUndo">Undo last point</button>` : ""}
     <button class="link" id="homeBtn" style="align-self:center">Back to home</button></div>` : ""}`;
   app.querySelectorAll(".pcard").forEach(b => b.onclick = () => point(+b.dataset.p));
@@ -398,6 +429,7 @@ function vGame(app) {
   $("#optBtn").onclick = $("#optBtn2").onclick = openGameOptions;
   if ($("#reportBtn")) $("#reportBtn").onclick = () => { const rec = finished().find(x => x.id === g.id) || Object.assign(toRecord(g), { local: !g.remote }); S.report = rec; S.screen = "report"; S.game = null; render(); };
   if ($("#overUndo")) $("#overUndo").onclick = undoLast;
+  if ($("#toTour")) $("#toTour").onclick = () => { const tid = g.tournamentId; S.game = null; openTour(tid); };
   if ($("#homeBtn")) $("#homeBtn").onclick = () => { S.game = null; render(); };
   if (!s.over) timerT = setInterval(() => { const t = $("#gtimer"); if (t && S.game) t.textContent = fmtDur(Date.now() - S.game.startedAt); }, 1000);
 }
@@ -429,7 +461,7 @@ async function point(p) {
     return render(true);
   }
   if (S.game && S.game.id === g.id && S.pending === 0) S.game = Object.assign(fromRow(data), { flip: g.flip });
-  if (data.status === "done") await loadLadder();
+  if (data.status === "done") { await loadLadder(); if (data.tournament_id) afterTourMatch(data.tournament_id); }
   render(true);
 }
 
@@ -446,7 +478,7 @@ async function undoLast() {
   S.pending--;
   if (error || !data) { if (S.game && S.game.id === g.id) Object.assign(S.game, before); toast("Couldn't undo. Check your connection."); return render(true); }
   if (S.game && S.game.id === g.id && S.pending === 0) S.game = Object.assign(fromRow(data), { flip: g.flip });
-  if (before.status === "done") await loadLadder();
+  if (before.status === "done") { await loadLadder(); if (data.tournament_id) afterTourMatch(data.tournament_id); }
   render(true);
 }
 
@@ -524,11 +556,13 @@ function vReport(app) {
     </div>
   </div>
   <div class="card wave r-up d3" style="height:130px"><span class="between small"><span class="soft">Momentum</span><span class="soft">Best run <b style="color:var(--ink)">${Math.max(st.run[0], st.run[1])}</b> · own serve <b style="color:var(--ink)">${pct(st.srvWon[0], st.srvTot[0])}</b> / <b style="color:var(--ink)">${pct(st.srvWon[1], st.srvTot[1])}</b></span></span><div style="flex:1;display:flex;align-items:flex-end">${wave(leadSeries(rec.g || []), 326, 84, "rwave", "Lead across the match, point by point").replace("<svg ", '<svg style="height:84px" ')}</div></div>
-  <p class="note r-up d4">${rec.local ? "Saved on this phone." : "Saved to the club ladder."}</p>
+  <p class="note r-up d4">${rec.local ? "Saved on this phone." : "Saved to the club ladder."}${rec.tournament ? " Part of " + esc(rec.tournament) + "." : ""}</p>
+  <button class="btn ghost small" id="repPdf" style="align-self:flex-start">${ICON.share.replace("<svg ", '<svg width="18" height="18" ')}Export this match as a PDF</button>
   <div style="display:grid;grid-template-columns:minmax(0,1.4fr) minmax(0,1fr);gap:10px">
     <button class="btn" id="rematch">Rematch</button><button class="btn ghost" id="toLadder">Ladder</button></div>
   ${canDel ? `<button class="link" id="delRec" style="align-self:center;color:var(--bad)">Delete this match</button>` : ""}`;
-  $("#closeRep").onclick = () => { S.screen = null; S.report = null; render(); };
+  $("#closeRep").onclick = () => { S.screen = S.tour && rec.tournament ? "tour" : null; S.report = null; render(); };
+  $("#repPdf").onclick = () => exportHistoryPdf([rec], `${rec.a} v ${rec.b}`);
   $("#toLadder").onclick = () => { S.screen = null; S.report = null; location.hash = "#ladder"; render(); };
   $("#rematch").onclick = () => {
     const opp = uid() ? S.profiles.find(p => p.id !== uid() && R.keyOf(p.name) === (R.keyOf(myName()) === rec.aKey ? rec.bKey : rec.aKey)) : null;
@@ -582,12 +616,13 @@ function openPlayer(k) {
 }
 function vSheets(app) {
   const fin = finished().slice().reverse();
-  app.innerHTML = `<header class="between r-up"><h1 style="font-size:28px">Score sheets</h1><span class="small muted">Newest first</span></header>
+  app.innerHTML = `<header class="between r-up"><h1 style="font-size:28px">Score sheets</h1>${fin.length ? `<button class="btn small ghost" id="sheetPdf">${ICON.share.replace("<svg ", '<svg width="18" height="18" ')}PDF</button>` : `<span class="small muted">Newest first</span>`}</header>
   ${fin.length ? `<div class="r-up d1" style="display:flex;flex-direction:column;gap:10px">${fin.map(m => `<button class="card sheetcard" data-id="${esc(m.id)}"><span class="between small muted"><span>${fmtDate(m.endedAt)}${m.local ? " · this phone" : ""}</span><span>${m.bestOf === 1 ? "1 game" : "Best of " + m.bestOf}</span></span>
     <span class="between"><span style="font-weight:${m.winner === 0 ? 700 : 500};min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(m.a)}</span><span class="num" style="font-size:28px">${m.gw[0]}–${m.gw[1]}</span><span style="font-weight:${m.winner === 1 ? 700 : 500};min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:right">${esc(m.b)}</span></span>
     <span class="gpills">${(m.g || []).map(s => { const [a, b] = R.gameScore([...s].map(Number)); return `<span>${a}–${b}</span>`; }).join("")}</span></button>`).join("")}</div>`
     : `<div class="card empty r-up d1"><b>No sheets yet</b>Every match you finish gets a score sheet here.</div>`}`;
   app.querySelectorAll("[data-id]").forEach(b => b.onclick = () => { S.report = finished().find(x => x.id === b.dataset.id); S.screen = "report"; render(); });
+  if ($("#sheetPdf")) $("#sheetPdf").onclick = () => exportHistoryPdf(finished(), "Match history");
 }
 function vYou(app) {
   const me = myName(), key = R.keyOf(me || ""), p = key ? R.computeBoard(finished()).byKey.get(key) : null;
@@ -612,6 +647,323 @@ function vYou(app) {
     if (error) { $("#nameErr").textContent = "Couldn't save your name."; return; }
     await loadProfiles(); render(true); toast("Name saved");
   };
+}
+
+/* ---------- tournaments ---------- */
+const MODE = {
+  koth: ["King of the hill", "The winner stays on the table and the next challenger steps up."],
+  round_robin: ["Everyone plays everyone", "Each player meets every other player once."],
+  bracket: ["Knockout bracket", "Single elimination. Byes go to the top of the draw."]
+};
+const fmtFormat = (b, t) => (b === 1 ? "1 game" : "Best of " + b) + (t === 21 ? " · to 21" : "");
+const toT = r => ({ id: r.id, name: r.name, mode: r.mode, crossTeam: r.cross_team, draw: r.draw, seed: r.seed, bestOf: r.best_of, target: r.target, code: r.join_code, status: r.status, owner: r.owner, champion: r.champion, createdAt: Date.parse(r.created_at) || 0, endedAt: r.ended_at ? Date.parse(r.ended_at) : null });
+const toTP = r => ({ id: r.id, name: r.name, team: r.team || "", userId: r.user_id || null, position: r.position, joinedRound: r.joined_round || 0 });
+async function loadTournaments() {
+  if (!sb || !uid()) { S.tournaments = []; return; }
+  const { data, error } = await sb.from("tournaments").select("*").order("created_at", { ascending: false }).limit(50);
+  if (!error) S.tournaments = (data || []).map(toT);
+}
+async function loadTour(id) {
+  const [t, p, m] = await Promise.all([
+    sb.from("tournaments").select("*").eq("id", id).maybeSingle(),
+    sb.from("tournament_players").select("*").eq("tournament_id", id).order("position", { ascending: true }),
+    sb.from("live_matches").select("*").eq("tournament_id", id)
+  ]);
+  if (t.error || !t.data) { if (S.tour && S.tour.t.id === id) S.tour = null; return null; }
+  S.tour = { t: toT(t.data), players: (p.data || []).map(toTP), matches: (m.data || []).map(fromRow) };
+  return S.tour;
+}
+const planOf = T => R.tournamentPlan(T.t, T.players, T.matches);
+const tpName = (T, id) => (T.players.find(p => p.id === id) || {}).name || "To be decided";
+const teamList = T => [...new Set(T.players.map(p => p.team).filter(Boolean))];
+const teamTag = (teams, team) => team ? `<span class="tt t${Math.max(0, teams.indexOf(team)) % 4}">${esc(team)}</span>` : "";
+let reconciling = false;
+/* Brings the server in line with the plan: removes unstarted matches that no longer belong, creates the next ones.
+   Safe to run on several phones at once: each slot is unique on the server. */
+async function reconcile() {
+  const T = S.tour;
+  if (!T || !isTKeeper(T.t.id) || reconciling) return;
+  reconciling = true;
+  try {
+    const plan = planOf(T), key = x => x.round + ":" + x.slot;
+    const want = new Map(plan.desired.map(d => [key(d), d]));
+    for (const m of T.matches) {
+      if (m.games.join("") !== "") continue;
+      const d = want.get(key(m));
+      if (!d || d.aTp !== m.aTp || d.bTp !== m.bTp) await sb.from("live_matches").delete().eq("id", m.id);
+    }
+    if (T.t.status === "live") {
+      const have = new Set(T.matches.filter(m => { const d = want.get(key(m)); return d && d.aTp === m.aTp && d.bTp === m.bTp; }).map(key));
+      for (const d of plan.desired) {
+        if (have.has(key(d))) continue;
+        const A = T.players.find(p => p.id === d.aTp), B = T.players.find(p => p.id === d.bTp);
+        if (!A || !B) continue;
+        const { error } = await sb.from("live_matches").insert({ a_name: A.name, b_name: B.name, a_user: A.userId, b_user: B.userId, best_of: T.t.bestOf, target: T.t.target, first_server: (d.round + d.slot) % 2, keepers: "tournament", tournament_id: T.t.id, round: d.round, slot: d.slot, a_tp: d.aTp, b_tp: d.bTp });
+        if (error && error.code !== "23505") console.warn("Rally: could not create a tournament match", error.message);
+      }
+      if (plan.complete && T.t.mode !== "koth") await sb.from("tournaments").update({ status: "done", ended_at: new Date().toISOString(), champion: plan.champion }).eq("id", T.t.id);
+    }
+    await loadTour(T.t.id);
+  } finally { reconciling = false; }
+}
+async function afterTourMatch(tid) {
+  if (!S.tour || S.tour.t.id !== tid) { if (S.screen !== "tour") return; await loadTour(tid); }
+  else await loadTour(tid);
+  await reconcile();
+  render(true);
+}
+async function openTour(id) {
+  S.screen = "tour"; S.tour = S.tour && S.tour.t.id === id ? S.tour : null;
+  if (!S.tour) { const app = $("#app"); app.innerHTML = `<div class="empty">Loading the tournament…</div>`; }
+  const T = await loadTour(id);
+  if (!T) { S.screen = null; render(); return toast("That tournament isn't available any more."); }
+  await reconcile(); render();
+}
+function openTourJoin() {
+  openSheet(`<div class="between"><h2 style="font-size:22px">Join a tournament</h2><button class="icon-btn" data-close aria-label="Close">${ICON.close}</button></div>
+    <form id="tjForm" style="display:flex;flex-direction:column;gap:12px"><div class="field"><label for="tjCode">4-digit tournament code</label><input class="input code" id="tjCode" inputmode="numeric" pattern="[0-9]{4}" maxlength="4" style="height:72px"></div>
+    <p class="err" id="tjErr"></p><button class="btn" type="submit">Join as scorekeeper</button></form>`,
+  close => {
+    $("#tjCode").focus();
+    $("#tjForm").onsubmit = async e => {
+      e.preventDefault();
+      const code = $("#tjCode").value.trim();
+      if (!/^\d{4}$/.test(code)) { $("#tjErr").textContent = "Enter the 4 digits from the host's phone."; return; }
+      const { data, error } = await sb.rpc("join_tournament", { p_code: code });
+      if (error || !data) { $("#tjErr").textContent = "No live tournament has that code."; return; }
+      S.tkeep.add(data); LS.set("rally.tkeep", [...S.tkeep].slice(-50));
+      close(); await loadTournaments(); toast("You can now score this tournament's matches"); openTour(data);
+    };
+  });
+}
+
+function vCups(app) {
+  if (!uid()) {
+    app.innerHTML = `<header class="r-up"><h1 style="font-size:28px">Tournaments</h1></header>
+      <div class="card pad r-up d1"><p class="soft" style="margin:0">Sign in to host tournaments, bring in another team and keep score together.</p></div>
+      ${sb ? `<button class="btn r-up d2" id="toSignIn2">Sign in or create an account</button>` : ""}`;
+    if ($("#toSignIn2")) $("#toSignIn2").onclick = () => { S.guest = false; LS.set("rally.guest", false); render(); };
+    return;
+  }
+  const live = S.tournaments.filter(t => t.status === "live"), done = S.tournaments.filter(t => t.status !== "live");
+  const card = (t, i) => `<button class="card pad r-up d${Math.min(5, i + 2)}" data-tour="${esc(t.id)}" style="display:flex;flex-direction:column;gap:6px;text-align:left;width:100%;${t.status === "live" ? "border-color:rgba(255,90,31,.4)" : ""}">
+      <span class="between"><b style="font-size:17px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(t.name)}</b><span class="tag ${t.status === "live" ? "" : "ghost"}">${t.status === "live" ? "Live" : "Finished"}</span></span>
+      <span class="small muted">${MODE[t.mode][0]} · ${fmtFormat(t.bestOf, t.target)} · ${fmtDate(t.createdAt)}</span></button>`;
+  app.innerHTML = `<header class="between r-up"><h1 style="font-size:28px">Tournaments</h1><button class="icon-btn" id="tJoinBtn" aria-label="Join a tournament with a code">${ICON.key}</button></header>
+    <button class="btn r-up d1" id="tNewBtn">${ICON.plus}Host a tournament</button>
+    ${live.length ? `<div class="sec r-up d2"><h2>Live</h2></div>${live.map(card).join("")}` : ""}
+    ${done.length ? `<div class="sec r-up d3"><h2>Finished</h2></div>${done.map(card).join("")}` : ""}
+    ${!S.tournaments.length ? `<div class="card empty r-up d2"><b>No tournaments yet</b>Host one for your club, or play UOGM v Curtin with cross-team pairing.</div>` : ""}`;
+  $("#tNewBtn").onclick = () => { S.tdraft = null; S.screen = "tnew"; render(); };
+  $("#tJoinBtn").onclick = openTourJoin;
+  app.querySelectorAll("[data-tour]").forEach(b => b.onclick = () => openTour(b.dataset.tour));
+}
+
+function vTourNew(app) {
+  const d = S.tdraft || (S.tdraft = { name: "", mode: "bracket", draw: "random", crossTeam: true, bestOf: 1, target: 11, teams: [], team: "", players: [], newName: "", newTeam: "" });
+  const added = new Set(d.players.map(p => R.keyOf(p.name)));
+  const members = S.profiles.filter(p => !added.has(R.keyOf(p.name)));
+  const drawOpts = d.mode === "bracket" ? [["random", "Random draw"], ["seeded", "Seeded by rating"]] : d.mode === "koth" ? [["random", "Random queue"], ["seeded", "Order added"]] : [];
+  app.innerHTML = `
+  <header class="row r-up"><button class="icon-btn" id="tnBack" aria-label="Back">${ICON.back}</button><h1 style="flex:1;text-align:center;font-size:19px;font-weight:600">New tournament</h1><span style="width:46px"></span></header>
+  <div class="field r-up d1"><label for="tnName">Name</label><input class="input" id="tnName" maxlength="60" placeholder="UOGM v Curtin" value="${esc(d.name)}"></div>
+  <div class="field r-up d1"><span class="small muted">Format</span>${Object.keys(MODE).map(k => `<button type="button" class="opt" data-mode="${k}" aria-pressed="${d.mode === k}"><b>${MODE[k][0]}</b><span>${MODE[k][1]}</span></button>`).join("")}</div>
+  <div class="row r-up d2" style="gap:10px"><div class="field" style="flex:1.4"><span class="small muted">Each match</span><div class="pills">${[1, 3, 5].map(n => `<button type="button" data-tbest="${n}" aria-pressed="${d.bestOf === n}">${n === 1 ? "1 game" : "Bo" + n}</button>`).join("")}</div></div>
+    <div class="field" style="flex:1"><span class="small muted">Points</span><div class="pills">${[11, 21].map(n => `<button type="button" data-ttarget="${n}" aria-pressed="${d.target === n}">${n}</button>`).join("")}</div></div></div>
+  ${drawOpts.length ? `<div class="field r-up d2"><span class="small muted">${d.mode === "bracket" ? "Draw" : "Queue"}</span><div class="pills">${drawOpts.map(([v, l]) => `<button type="button" data-draw="${v}" aria-pressed="${d.draw === v}">${l}</button>`).join("")}</div></div>` : ""}
+  <div class="card pad r-up d3" style="display:flex;flex-direction:column;gap:10px">
+    <span style="font-weight:600">Teams <span class="small muted">(optional)</span></span>
+    ${d.teams.length ? `<div class="chips">${d.teams.map((t, i) => `<span class="tt t${i % 4}" style="font-size:13px;padding:6px 6px 6px 10px;display:inline-flex;align-items:center;gap:4px">${esc(t)}<button class="xbtn" style="width:24px;height:24px" data-rmteam="${i}" aria-label="Remove team ${esc(t)}">${ICON.close}</button></span>`).join("")}</div>` : ""}
+    <div class="row" style="gap:8px"><input class="input" id="tnTeam" maxlength="32" placeholder="Team name, e.g. UOGM" value="${esc(d.newTeam)}" style="flex:1"><button class="btn small ghost" id="tnAddTeam">Add</button></div>
+    ${d.teams.length >= 2 ? `<label class="toggle"><input type="checkbox" id="tnCross" ${d.crossTeam ? "checked" : ""}>Pair players from different teams${d.mode === "round_robin" ? " only" : ""}</label>` : ""}
+  </div>
+  <div class="card pad r-up d4" style="display:flex;flex-direction:column;gap:10px">
+    <span class="between"><span style="font-weight:600">Players</span><span class="small muted">${d.players.length} added</span></span>
+    ${d.teams.length ? `<div class="pills" role="group" aria-label="Team for new players">${[""].concat(d.teams).map(t => `<button type="button" data-pteam="${esc(t)}" aria-pressed="${d.team === t}">${t ? esc(t) : "No team"}</button>`).join("")}</div>` : ""}
+    <div class="row" style="gap:8px"><input class="input" id="tnPlayer" maxlength="32" placeholder="Player name" value="${esc(d.newName)}" style="flex:1"><button class="btn small" id="tnAddPlayer">Add</button></div>
+    ${members.length ? `<span class="small muted">From your club${d.team ? " · adds to " + esc(d.team) : ""}</span><div class="chips">${members.map(p => `<button class="chip" data-member="${esc(p.id)}">${av(p.name)}${esc(p.name)}</button>`).join("")}</div>` : ""}
+    <div class="plist">${d.players.map((p, i) => `<div class="pitem">${av(p.name, "sm")}<span class="nm">${esc(p.name)}</span>${teamTag(d.teams, p.team)}<button class="xbtn" data-rmp="${i}" aria-label="Remove ${esc(p.name)}">${ICON.close}</button></div>`).join("")}</div>
+  </div>
+  <p class="err" id="tnErr"></p>
+  <button class="btn r-up d5" id="tnStart">${ICON.play}Start tournament</button>`;
+  const keep = () => { d.name = $("#tnName").value; d.newName = $("#tnPlayer").value; d.newTeam = $("#tnTeam").value; if ($("#tnCross")) d.crossTeam = $("#tnCross").checked; };
+  const again = () => { keep(); render(true); };
+  $("#tnBack").onclick = () => { S.screen = null; render(); };
+  app.querySelectorAll("[data-mode]").forEach(b => b.onclick = () => { d.mode = b.dataset.mode; again(); });
+  app.querySelectorAll("[data-tbest]").forEach(b => b.onclick = () => { d.bestOf = +b.dataset.tbest; again(); });
+  app.querySelectorAll("[data-ttarget]").forEach(b => b.onclick = () => { d.target = +b.dataset.ttarget; again(); });
+  app.querySelectorAll("[data-draw]").forEach(b => b.onclick = () => { d.draw = b.dataset.draw; again(); });
+  app.querySelectorAll("[data-pteam]").forEach(b => b.onclick = () => { d.team = b.dataset.pteam; again(); });
+  app.querySelectorAll("[data-rmteam]").forEach(b => b.onclick = () => { keep(); const t = d.teams.splice(+b.dataset.rmteam, 1)[0]; d.players.forEach(p => { if (p.team === t) p.team = ""; }); if (d.team === t) d.team = ""; render(true); });
+  app.querySelectorAll("[data-rmp]").forEach(b => b.onclick = () => { keep(); d.players.splice(+b.dataset.rmp, 1); render(true); });
+  const addPlayer = (name, userId) => {
+    name = (name || "").trim(); if (!name) return;
+    if (d.players.some(p => R.keyOf(p.name) === R.keyOf(name))) return toast(name + " is already in the tournament.");
+    d.players.push({ name, team: d.team, userId: userId || null });
+  };
+  $("#tnAddTeam").onclick = () => { keep(); const t = d.newTeam.trim(); if (!t) return; if (d.teams.some(x => x.toLowerCase() === t.toLowerCase())) return toast("That team is already added."); d.teams.push(t); d.newTeam = ""; if (!d.team) d.team = t; render(true); $("#tnTeam").focus(); };
+  $("#tnAddPlayer").onclick = () => { keep(); addPlayer(d.newName); d.newName = ""; render(true); $("#tnPlayer").focus(); };
+  $("#tnPlayer").onkeydown = e => { if (e.key === "Enter") { e.preventDefault(); $("#tnAddPlayer").click(); } };
+  $("#tnTeam").onkeydown = e => { if (e.key === "Enter") { e.preventDefault(); $("#tnAddTeam").click(); } };
+  app.querySelectorAll("[data-member]").forEach(b => b.onclick = () => { keep(); const p = S.profiles.find(x => x.id === b.dataset.member); if (p) addPlayer(p.name, p.id); render(true); });
+  $("#tnStart").onclick = async () => {
+    keep();
+    const err = $("#tnErr"), name = d.name.trim();
+    if (!name) { err.textContent = "Give the tournament a name."; return; }
+    if (d.players.length < 2) { err.textContent = "Add at least two players."; return; }
+    const cross = d.crossTeam && d.teams.length >= 2;
+    if (cross && d.mode === "round_robin" && new Set(d.players.map(p => p.team).filter(Boolean)).size < 2) { err.textContent = "Put players in at least two teams, or turn off cross-team pairing."; return; }
+    let order = d.players.slice();
+    if (d.mode === "bracket" && d.draw === "seeded") { const board = R.computeBoard(finished()).byKey; order.sort((x, y) => ((board.get(R.keyOf(y.name)) || { r: 1000 }).r) - ((board.get(R.keyOf(x.name)) || { r: 1000 }).r)); }
+    if (d.mode === "koth" && d.draw === "random") order = R.shuffled(order, Date.now() & 0x7fffffff);
+    const btn = $("#tnStart"); btn.disabled = true;
+    const ins = await sb.from("tournaments").insert({ name, mode: d.mode, cross_team: cross, draw: d.draw, best_of: d.bestOf, target: d.target }).select().single();
+    if (ins.error || !ins.data) { btn.disabled = false; err.textContent = "Couldn't create the tournament. Check your connection."; return; }
+    const tid = ins.data.id;
+    const pl = await sb.from("tournament_players").insert(order.map((p, i) => ({ tournament_id: tid, name: p.name.trim(), team: p.team || "", user_id: p.userId, position: i })));
+    if (pl.error) { btn.disabled = false; err.textContent = "The tournament was created but the players weren't saved. Open it from Tournaments and try again."; return; }
+    S.tdraft = null; await loadTournaments(); openTour(tid);
+  };
+}
+
+function vTour(app) {
+  const T = S.tour, t = T.t, plan = planOf(T), keeper = isTKeeper(t.id), owner = t.owner === uid();
+  const teams = teamList(T), st = R.standings(T.players, T.matches);
+  const byKey = new Map(T.matches.map(m => [m.round + ":" + m.slot, m]));
+  const live = plan.desired.map(d => byKey.get(d.round + ":" + d.slot)).filter(m => m && m.status === "live");
+  const waiting = plan.desired.filter(d => !byKey.has(d.round + ":" + d.slot));
+  const doneM = T.matches.filter(m => m.status === "done").sort((a, b) => (b.endedAt || 0) - (a.endedAt || 0));
+  const champ = plan.champion && (plan.complete || t.mode === "koth") ? tpName(T, plan.champion) : "";
+  const mrow = m => { const s = R.summarize(R.toMatch(m.games, m.bestOf, m.target, m.firstServer)); const started = m.games.join("") !== "";
+    return `<button class="mrow" data-m="${esc(m.id)}"><span class="who"><span style="font-weight:600">${esc(m.a)} <span class="muted">v</span> ${esc(m.b)}</span><span class="small muted">${t.mode === "bracket" ? roundName(m.round, plan) : t.mode === "round_robin" ? "Round " + (m.round + 1) : "Match " + (m.round + 1)}${started ? ` · game ${s.g + 1}: ${s.cur[0]}–${s.cur[1]}` : ""}</span></span><span class="tag ${keeper ? "" : "ghost"}">${keeper ? (started ? "Score" : "Start") : "Watch"}</span></button>`; };
+  let body = "";
+  if (t.mode === "koth") {
+    const k = plan.koth, cur = k.champion ? k.streaks.get(k.champion) : null;
+    body = `<div class="card pad r-up d2" style="position:relative;overflow:hidden;border-color:rgba(255,90,31,.45)"><span style="position:absolute;right:-60px;top:-80px;width:240px;height:220px;border-radius:50%;background:radial-gradient(closest-side,rgba(255,90,31,.45),rgba(255,90,31,0))"></span>
+      <span class="small" style="position:relative;color:#ffd2bf">${t.status === "live" ? "On the table" : "Last one standing"}</span>
+      <div class="row" style="position:relative;margin-top:6px">${av(champ || "?", "a")}<span style="flex:1;min-width:0"><b style="font-size:24px;display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(champ || "Waiting for players")}</b><span class="small soft">${cur ? `${cur.cur} win${cur.cur === 1 ? "" : "s"} in a row · best ${cur.best}` : ""}</span></span></div></div>
+      <div class="card pad r-up d3" style="display:flex;flex-direction:column;gap:8px"><span class="between"><span style="font-weight:600">Queue</span><span class="small muted">${k.queue.length} waiting</span></span>
+      <div class="plist">${k.queue.slice(0, 8).map((id, i) => { const p = T.players.find(x => x.id === id) || {}; return `<div class="pitem"><span class="muted" style="width:18px">${i + 1}</span>${av(p.name, "sm")}<span class="nm">${esc(p.name)}</span>${teamTag(teams, p.team)}</div>`; }).join("")}</div>
+      ${keeper && t.status === "live" ? `<div class="row" style="gap:8px"><input class="input" id="kAdd" maxlength="32" placeholder="Add a player to the queue" style="flex:1"><button class="btn small ghost" id="kAddBtn">Add</button></div>${teams.length ? `<div class="pills">${teams.map((tm, i) => `<button type="button" data-kteam="${esc(tm)}" aria-pressed="${(S.kteam || teams[0]) === tm}">${esc(tm)}</button>`).join("")}</div>` : ""}` : ""}</div>`;
+  } else if (t.mode === "bracket") {
+    body = `<div class="bracket r-up d2">${(plan.tree || []).map((row, r) => `<div class="bcol"><h3>${roundName(r, plan)}</h3>${row.map(s => { const m = byKey.get(r + ":" + s.slot); const sum = m ? R.summarize(R.toMatch(m.games, m.bestOf, m.target)) : null;
+        const ln = (id, side) => `<span class="ln ${s.winner ? (s.winner === id ? "w" : "") : ""} ${id ? "" : "tbd"}"><span>${esc(id ? tpName(T, id) : (s.bye && side === 1 ? "Bye" : "To be decided"))}</span><span>${sum ? sum.gw[side] : ""}</span></span>`;
+        return `<button class="bm ${m && m.status === "live" && m.games.join("") ? "live" : ""}" ${m ? `data-m="${esc(m.id)}"` : "disabled"}>${ln(s.aTp, 0)}${ln(s.bTp, 1)}</button>`; }).join("")}</div>`).join("")}</div>`;
+  }
+  const table = `<div class="card pad r-up d3" style="overflow-x:auto"><table class="tbl"><thead><tr><th>Player</th><th>P</th><th>W</th><th>L</th><th>Games</th><th>Pts</th></tr></thead><tbody>${st.players.map((p, i) => `<tr><td>${i + 1}. ${esc(p.name)} ${teamTag(teams, p.team)}</td><td>${p.p}</td><td>${p.w}</td><td>${p.l}</td><td>${p.gw}–${p.gl}</td><td>${sign(p.pf - p.pa).replace("−", "-")}</td></tr>`).join("")}</tbody></table></div>`;
+  app.innerHTML = `
+  <header class="row r-up"><button class="icon-btn" id="tBack" aria-label="Back">${ICON.back}</button>
+    <div style="flex:1;min-width:0;text-align:center"><b style="display:block;font-size:18px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(t.name)}</b><span class="small muted">${MODE[t.mode][0]} · ${fmtFormat(t.bestOf, t.target)}${t.status === "done" ? " · finished" : ""}</span></div>
+    <button class="icon-btn" id="tPdf" aria-label="Export this tournament as a PDF">${ICON.share}</button></header>
+  ${keeper && t.status === "live" ? `<div class="card pad between r-up d1"><span><span class="small muted">Scorekeeper code</span><br><span class="num" style="font-size:30px;letter-spacing:.25em" id="tCodeTxt">${esc(t.code)}</span></span><button class="btn small ghost" id="tCopy">Copy</button></div>` : ""}
+  ${teams.length >= 2 ? `<div class="card pad teams r-up d1">${st.teams.slice(0, 2).map((x, i) => `<span>${i ? "" : ""}<b style="display:block">${esc(x.team)}</b><span class="num" style="font-size:40px">${x.wins}</span></span>`).join('<span class="muted small">match wins</span>')}</div>${teams.length > 2 ? `<p class="note">${st.teams.slice(2).map(x => esc(x.team) + " " + x.wins).join(" · ")}</p>` : ""}` : ""}
+  ${champ && t.mode !== "koth" ? `<div class="card pad r-up d1" style="border-color:rgba(255,90,31,.5);text-align:center"><span class="small" style="color:#ffd2bf">Champion</span><div style="font-size:28px;font-weight:700">${esc(champ)}</div></div>` : ""}
+  ${body}
+  ${t.mode !== "bracket" || plan.complete ? table : ""}
+  ${live.length ? `<div class="sec r-up d3"><h2>Play now</h2><span class="small muted">${live.length}</span></div><div style="display:flex;flex-direction:column;gap:8px" class="r-up d3">${live.map(mrow).join("")}</div>` : ""}
+  ${waiting.length && !keeper ? `<p class="note">${waiting.length} match${waiting.length > 1 ? "es are" : " is"} waiting for a scorekeeper to open ${waiting.length > 1 ? "them" : "it"}.</p>` : ""}
+  ${doneM.length ? `<div class="sec r-up d4"><h2>Finished</h2><span class="small muted">${doneM.length}</span></div><div style="display:flex;flex-direction:column;gap:8px" class="r-up d4">${doneM.map(m => { const s = R.summarize(R.toMatch(m.games, m.bestOf, m.target)); return `<button class="mrow" data-rec="${esc(m.id)}"><span class="who"><span><b style="font-weight:${s.winner === 0 ? 700 : 400}">${esc(m.a)}</b> <span class="muted">v</span> <b style="font-weight:${s.winner === 1 ? 700 : 400}">${esc(m.b)}</b></span><span class="small muted">${m.games.filter(Boolean).map(g => R.gameScore([...g].map(Number)).join("–")).join("  ")}</span></span><span class="num" style="font-size:22px">${s.gw[0]}–${s.gw[1]}</span></button>`; }).join("")}</div>` : ""}
+  ${keeper && t.status === "live" && t.mode === "koth" ? `<button class="btn ghost" id="tEnd">End the tournament</button>` : ""}
+  <button class="btn ghost" id="tPdf2">Export tournament PDF</button>
+  ${owner ? `<button class="link" id="tDel" style="align-self:center;color:var(--bad)">Delete tournament</button>` : ""}`;
+  $("#tBack").onclick = () => { S.screen = null; S.tour = null; location.hash = "#cups"; render(); };
+  $("#tPdf").onclick = $("#tPdf2").onclick = () => exportTournamentPdf(T);
+  if ($("#tCopy")) $("#tCopy").onclick = async () => { try { await navigator.clipboard.writeText(t.code); toast("Code copied"); } catch (e) { toast("Code: " + t.code); } };
+  app.querySelectorAll("[data-m]").forEach(b => b.onclick = () => { const m = T.matches.find(x => x.id === b.dataset.m); if (m) { S.game = Object.assign({}, m, { flip: 0 }); render(); } });
+  app.querySelectorAll("[data-rec]").forEach(b => b.onclick = () => { const rec = finished().find(x => x.id === b.dataset.rec); const m = T.matches.find(x => x.id === b.dataset.rec); S.report = rec || (m && Object.assign(toRecord(m), { tournament: t.name })); if (S.report) { S.screen = "report"; render(); } });
+  app.querySelectorAll("[data-kteam]").forEach(b => b.onclick = () => { S.kteam = b.dataset.kteam; render(true); });
+  if ($("#kAddBtn")) $("#kAddBtn").onclick = async () => {
+    const name = $("#kAdd").value.trim(); if (!name) return;
+    if (T.players.some(p => R.keyOf(p.name) === R.keyOf(name))) return toast(name + " is already in the tournament.");
+    const pos = T.players.reduce((m, p) => Math.max(m, p.position), 0) + 1;
+    const { error } = await sb.from("tournament_players").insert({ tournament_id: t.id, name, team: teams.length ? (S.kteam || teams[0]) : "", position: pos, joined_round: plan.koth.nextRound });
+    if (error) return toast("Couldn't add the player.");
+    await loadTour(t.id); await reconcile(); render(true); toast(name + " joined the queue");
+  };
+  if ($("#tEnd")) { let armed = false; $("#tEnd").onclick = async e => { if (!armed) { armed = true; e.currentTarget.textContent = "Tap again to end"; return; } await sb.from("tournaments").update({ status: "done", ended_at: new Date().toISOString(), champion: plan.champion }).eq("id", t.id); await loadTour(t.id); await reconcile(); await loadTournaments(); render(true); toast("Tournament finished"); }; }
+  if ($("#tDel")) { let armed = false; $("#tDel").onclick = async e => { if (!armed) { armed = true; e.currentTarget.textContent = "Tap again to delete for everyone"; return; } const { error } = await sb.from("tournaments").delete().eq("id", t.id); if (error) return toast("Couldn't delete the tournament."); S.tour = null; S.screen = null; await loadTournaments(); location.hash = "#cups"; render(); toast("Tournament deleted"); }; }
+}
+function roundName(r, plan) {
+  const n = (plan.tree || []).length; if (!n) return "Round " + (r + 1);
+  const left = n - r; return left === 1 ? "Final" : left === 2 ? "Semi-finals" : left === 3 ? "Quarter-finals" : "Round " + (r + 1);
+}
+
+/* ---------- PDF export ---------- */
+const pdfText = s => String(s == null ? "" : s).replace(/−/g, "-").replace(/[^\x20-\x7E -ÿ–—·]/g, "?");
+function pdfDoc(title, subtitle) {
+  const J = window.jspdf && window.jspdf.jsPDF;
+  if (!J) throw new Error("The PDF tools didn't load.");
+  const doc = new J({ orientation: "landscape", unit: "pt", format: "a4" }), W = doc.internal.pageSize.getWidth();
+  doc.setFillColor(9, 9, 11); doc.rect(0, 0, W, 74, "F");
+  doc.setFillColor(255, 90, 31); doc.circle(48, 37, 13, "F");
+  doc.setFont("helvetica", "bold"); doc.setFontSize(20); doc.setTextColor(245, 245, 247); doc.text("RALLY", 70, 44);
+  doc.setFontSize(15); doc.text(pdfText(title), 160, 36);
+  doc.setFont("helvetica", "normal"); doc.setFontSize(10); doc.setTextColor(170, 170, 180); doc.text(pdfText(subtitle), 160, 54);
+  doc.setTextColor(20, 20, 24);
+  return doc;
+}
+function pdfTable(doc, opts) {
+  const base = { theme: "grid", styles: { font: "helvetica", fontSize: 8.5, cellPadding: 4, lineColor: [225, 225, 230], lineWidth: 0.5, textColor: [24, 24, 28] }, headStyles: { fillColor: [255, 90, 31], textColor: 255, fontStyle: "bold" }, alternateRowStyles: { fillColor: [247, 247, 249] }, margin: { left: 36, right: 36 } };
+  const o = Object.assign({}, base, opts, { body: opts.body.map(r => r.map(pdfText)), head: opts.head.map(r => r.map(pdfText)) });
+  if (typeof doc.autoTable === "function") doc.autoTable(o);
+  else { const g = window.jspdfAutoTable; const f = g && (g.autoTable || g.default || g); f(doc, o); }
+  return doc.lastAutoTable ? doc.lastAutoTable.finalY : 100;
+}
+function pdfHeading(doc, y, text) { doc.setFont("helvetica", "bold"); doc.setFontSize(12); doc.setTextColor(24, 24, 28); doc.text(pdfText(text), 36, y); return y + 8; }
+function matchRows(list) {
+  const board = R.computeBoard(finished());
+  return list.map(m => {
+    const st = R.stats(R.fromRecord(m)), d = board.deltas.get(m.id), scores = (m.g || []).map(s => R.gameScore([...s].map(Number)).join("-"));
+    return [fmtDate(m.endedAt), m.tournament || "", m.a + " v " + m.b, m.gw[0] + "-" + m.gw[1], m.winner ? m.b : m.a, scores.join(", "),
+      st.pts[0] + "-" + st.pts[1], st.run[0] + "-" + st.run[1], pct(st.srvWon[0], st.srvTot[0]) + " / " + pct(st.srvWon[1], st.srvTot[1]),
+      fmtDur(m.endedAt - m.startedAt), d ? (d[0] >= 0 ? "+" : "") + d[0] + " / " + (d[1] >= 0 ? "+" : "") + d[1] : ""];
+  });
+}
+const MATCH_HEAD = [["Date", "Tournament", "Match", "Games", "Winner", "Game scores", "Points", "Best run", "Won on own serve", "Time", "Rating +/-"]];
+function pageNumbers(doc) {
+  const n = doc.internal.getNumberOfPages(), W = doc.internal.pageSize.getWidth(), H = doc.internal.pageSize.getHeight();
+  for (let i = 1; i <= n; i++) { doc.setPage(i); doc.setFont("helvetica", "normal"); doc.setFontSize(8); doc.setTextColor(140, 140, 150); doc.text("Rally · page " + i + " of " + n, W - 36, H - 18, { align: "right" }); }
+}
+async function savePdf(doc, filename) {
+  const C = window.Capacitor, FS = C && C.Plugins && C.Plugins.Filesystem, SH = C && C.Plugins && C.Plugins.Share;
+  if (C && C.isNativePlatform && C.isNativePlatform() && FS) {
+    const data = doc.output("datauristring").split(",")[1];
+    const res = await FS.writeFile({ path: filename, data, directory: "CACHE" });
+    if (SH) { try { await SH.share({ title: filename, url: res.uri, dialogTitle: "Save or send the PDF" }); } catch (e) { /* share sheet closed */ } }
+    else toast("Saved " + filename);
+    return;
+  }
+  doc.save(filename);
+}
+async function exportHistoryPdf(list, label) {
+  try {
+    if (!list.length) return toast("There are no matches to export yet.");
+    const players = new Set(); list.forEach(m => { players.add(m.a); players.add(m.b); });
+    const doc = pdfDoc(label || "Match history", `${list.length} match${list.length > 1 ? "es" : ""} · ${players.size} players · ${fmtDate(list[0].endedAt)} to ${fmtDate(list[list.length - 1].endedAt)} · exported ${fmtDate(Date.now())}`);
+    pdfTable(doc, { startY: 92, head: MATCH_HEAD, body: matchRows(list) });
+    pageNumbers(doc);
+    await savePdf(doc, "rally-history-" + new Date().toISOString().slice(0, 10) + ".pdf");
+  } catch (e) { toast("Couldn't make the PDF: " + (e.message || e)); }
+}
+async function exportTournamentPdf(T) {
+  try {
+    const t = T.t, plan = planOf(T), st = R.standings(T.players, T.matches), teams = teamList(T);
+    const champ = plan.champion && (plan.complete || t.mode === "koth") ? tpName(T, plan.champion) : "";
+    const doc = pdfDoc(t.name, `${MODE[t.mode][0]} · ${fmtFormat(t.bestOf, t.target)} · ${T.players.length} players · ${t.status === "done" ? "finished" : "in progress"} · started ${fmtDate(t.createdAt)}${champ ? " · " + (t.mode === "koth" ? "on the table: " : "champion: ") + champ : ""}`);
+    let y = 96;
+    if (teams.length >= 2) { y = pdfHeading(doc, y, "Teams"); y = pdfTable(doc, { startY: y, head: [["Team", "Players", "Match wins"]], body: st.teams.map(x => [x.team, T.players.filter(p => p.team === x.team).map(p => p.name).join(", "), String(x.wins)]), columnStyles: { 1: { cellWidth: 420 } } }) + 22; }
+    y = pdfHeading(doc, y, "Standings");
+    y = pdfTable(doc, { startY: y, head: [["#", "Player", "Team", "Played", "Won", "Lost", "Games", "Points for", "Points against"]], body: st.players.map((p, i) => [String(i + 1), p.name, p.team, String(p.p), String(p.w), String(p.l), p.gw + "-" + p.gl, String(p.pf), String(p.pa)]) }) + 22;
+    if (t.mode === "bracket" && plan.tree) {
+      y = pdfHeading(doc, y, "Bracket");
+      const byKey = new Map(T.matches.map(m => [m.round + ":" + m.slot, m]));
+      y = pdfTable(doc, { startY: y, head: [["Round", "Match", "Result", "Winner"]], body: plan.tree.flatMap((row, r) => row.map(s => { const m = byKey.get(r + ":" + s.slot), sum = m ? R.summarize(R.toMatch(m.games, m.bestOf, m.target)) : null; return [roundName(r, plan), (s.aTp ? tpName(T, s.aTp) : "TBD") + " v " + (s.bTp ? tpName(T, s.bTp) : (s.bye ? "bye" : "TBD")), sum ? sum.gw[0] + "-" + sum.gw[1] : "", s.winner ? tpName(T, s.winner) : ""]; })) }) + 22;
+    }
+    const recs = T.matches.filter(m => m.status === "done").sort((a, b) => (a.endedAt || 0) - (b.endedAt || 0)).map(m => Object.assign(toRecord(m), { tournament: t.name }));
+    if (recs.length) { y = pdfHeading(doc, y, "Matches"); pdfTable(doc, { startY: y, head: MATCH_HEAD, body: matchRows(recs) }); }
+    pageNumbers(doc);
+    await savePdf(doc, "rally-" + (t.name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") || "tournament") + ".pdf");
+  } catch (e) { toast("Couldn't make the PDF: " + (e.message || e)); }
 }
 
 /* ---------- boot ---------- */

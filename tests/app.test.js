@@ -23,8 +23,9 @@ function liveRow(over) {
 function fakeSupabase(opts = {}) {
   const calls = [];
   let session = opts.session === undefined ? { user: ME } : opts.session;
-  let authCb = null, rt = null;
-  const tables = { matches: opts.matches || [], profiles: opts.profiles || [{ id: ME.id, name: "Maya" }, { id: "u-theo", name: "Theo" }], live_matches: opts.live || [] };
+  let authCb = null; const rt = {};
+  const tables = { matches: opts.matches || [], profiles: opts.profiles || [{ id: ME.id, name: "Maya" }, { id: "u-theo", name: "Theo" }], live_matches: opts.live || [], tournaments: [], tournament_players: [] };
+  let nextId = 1;
   const from = table => {
     const st = { table, op: "select", filters: [], payload: null, single: false };
     const q = {
@@ -35,7 +36,15 @@ function fakeSupabase(opts = {}) {
       then(res, rej) {
         calls.push(st);
         let data = null;
-        if (st.op === "insert" && table === "live_matches") { data = liveRow(Object.assign({ id: "22222222-2222-2222-2222-222222222222" }, st.payload)); tables.live_matches.push(data); }
+        if (st.op === "insert" && table === "live_matches" && !st.payload.tournament_id) { data = liveRow(Object.assign({ id: "22222222-2222-2222-2222-222222222222" }, st.payload)); tables.live_matches.push(data); }
+        else if (st.op === "insert" && table === "live_matches") {
+          if (tables.live_matches.some(r => r.tournament_id === st.payload.tournament_id && r.round === st.payload.round && r.slot === st.payload.slot)) return Promise.resolve({ data: null, error: { code: "23505", message: "duplicate" } }).then(res, rej);
+          data = liveRow(Object.assign({ id: "lm" + (nextId++) }, st.payload)); tables.live_matches.push(data);
+        }
+        else if (st.op === "insert" && table === "tournaments") { data = Object.assign({ id: "t" + (nextId++), owner: ME.id, seed: 12345, join_code: "7777", status: "live", champion: null, created_at: new Date().toISOString(), ended_at: null }, st.payload); tables.tournaments.push(data); }
+        else if (st.op === "insert" && table === "tournament_players") { data = [].concat(st.payload).map(p => Object.assign({ id: "tp" + (nextId++), joined_round: 0, user_id: null }, p)); tables.tournament_players.push(...data); }
+        else if (st.op === "update") { tables[table].filter(r => st.filters.every(([c, v]) => r[c] === v)).forEach(r => Object.assign(r, st.payload)); }
+        else if (st.op === "delete") { tables[table] = tables[table].filter(r => !st.filters.every(([c, v]) => r[c] === v)); }
         else if (st.op === "select") { data = tables[table].filter(r => st.filters.every(([c, v]) => r[c] === v)); if (st.single) data = data[0] || null; }
         return Promise.resolve({ data, error: null }).then(res, rej);
       }
@@ -64,10 +73,10 @@ function fakeSupabase(opts = {}) {
       signUp: async () => ({ data: { session: null }, error: null }),
       signOut: async () => { session = null; authCb && authCb("SIGNED_OUT", null); return { error: null }; }
     },
-    channel: () => ({ on(_e, _f, h) { rt = h; return this; }, subscribe() { return this; } }),
+    channel: () => ({ on(_e, f, h) { rt[f.table] = h; return this; }, subscribe() { return this; } }),
     removeChannel() {}
   };
-  return { client, calls, tables, emit: p => rt && rt(p) };
+  return { client, calls, tables, emit: (p, table = "live_matches") => rt[table] && rt[table](p) };
 }
 function boot(fake) {
   const dom = new JSDOM(html.replace(/<script src="[^"]+"><\/script>/g, ""), { url: "https://localhost/", runScripts: "outside-only", pretendToBeVisual: true });
@@ -83,8 +92,10 @@ const text = w => w.document.getElementById("app").textContent;
 const tap = (w, p) => $(w, `.pcard[data-p="${p}"]`).click();
 
 test("index.html loads the Supabase client, config, rules and app in order", () => {
-  assert.deepEqual([...html.matchAll(/<script src="([^"]+)"/g)].map(m => m[1]), ["vendor/supabase.js", "config.js", "rules.js", "app.js"]);
+  assert.deepEqual([...html.matchAll(/<script src="([^"]+)"/g)].map(m => m[1]), ["vendor/supabase.js", "vendor/jspdf.js", "vendor/jspdf-autotable.js", "config.js", "rules.js", "app.js"]);
   assert.match(html, /viewport-fit=cover/);
+  assert.match(html, /user-scalable=no/, "double-tap zoom is off");
+  assert.match(html, /touch-action:manipulation/);
   assert.match(html, /prefers-reduced-motion/);
 });
 
@@ -191,4 +202,88 @@ test("the ladder ranks finished matches from the server", async () => {
   assert.match(text(w), /Top of the ladder/);
   assert.match(text(w), /Maya1020/);
   assert.match(text(w), /Sam/);
+});
+
+test("hosts a UOGM v Curtin knockout: every first-round match crosses teams", async () => {
+  const fake = fakeSupabase({ profiles: [{ id: ME.id, name: "Maya" }] });
+  const w = boot(fake);
+  await settle();
+  w.location.hash = "#cups"; w.dispatchEvent(new w.HashChangeEvent("hashchange"));
+  $(w, "#tNewBtn").click();
+  $(w, "#tnName").value = "UOGM v Curtin";
+  for (const team of ["UOGM", "Curtin"]) { $(w, "#tnTeam").value = team; $(w, "#tnAddTeam").click(); }
+  const add = (team, names) => { $(w, `[data-pteam="${team}"]`).click(); for (const n of names) { $(w, "#tnPlayer").value = n; $(w, "#tnAddPlayer").click(); } };
+  add("UOGM", ["Ali", "Bea", "Cai", "Dev"]);
+  add("Curtin", ["Eve", "Fin", "Gus", "Hal"]);
+  assert.equal(w.document.querySelectorAll(".pitem").length, 8);
+  assert.ok($(w, "#tnCross").checked, "cross-team pairing is on by default");
+  $(w, "#tnStart").click();
+  await settle(30);
+  const t = fake.tables.tournaments[0];
+  assert.equal(t.mode, "bracket"); assert.equal(t.cross_team, true);
+  const team = Object.fromEntries(fake.tables.tournament_players.map(p => [p.id, p.team]));
+  const first = fake.tables.live_matches.filter(m => m.tournament_id === t.id && m.round === 0);
+  assert.equal(first.length, 4);
+  for (const m of first) assert.notEqual(team[m.a_tp], team[m.b_tp], `${m.a_name} v ${m.b_name}`);
+  assert.match(text(w), /Quarter-finals/);
+  assert.match(text(w), /Scorekeeper code/);
+  // score the first match through and the next round appears
+  const m0 = first[0];
+  $(w, `[data-m="${m0.id}"]`).click();
+  for (let i = 0; i < 11; i++) tap(w, 0);
+  await settle(30);
+  assert.ok(fake.calls.filter(c => c.rpc === "score_point").length >= 11);
+});
+
+test("King of the hill keeps the winner on and queues the loser", async () => {
+  const fake = fakeSupabase({ profiles: [{ id: ME.id, name: "Maya" }] });
+  const w = boot(fake);
+  await settle();
+  w.location.hash = "#cups"; w.dispatchEvent(new w.HashChangeEvent("hashchange"));
+  $(w, "#tNewBtn").click();
+  $(w, "#tnName").value = "Friday hill";
+  $(w, '[data-mode="koth"]').click();
+  $(w, '[data-draw="seeded"]').click();
+  for (const n of ["Ali", "Bea", "Cai"]) { $(w, "#tnPlayer").value = n; $(w, "#tnAddPlayer").click(); }
+  $(w, "#tnStart").click();
+  await settle(30);
+  assert.match(text(w), /On the table/);
+  assert.match(text(w), /Ali/);
+  const m0 = fake.tables.live_matches.find(m => m.round === 0);
+  assert.deepEqual([m0.a_name, m0.b_name], ["Ali", "Bea"]);
+  // Bea wins: she stays on, Cai challenges next
+  $(w, `[data-m="${m0.id}"]`).click();
+  for (let i = 0; i < 11; i++) tap(w, 1);
+  await settle(40);
+  const m1 = fake.tables.live_matches.find(m => m.round === 1);
+  assert.ok(m1, "next match created");
+  assert.deepEqual([m1.a_name, m1.b_name], ["Bea", "Cai"]);
+});
+
+test("exports match history as a real PDF", async () => {
+  const dom = new JSDOM(html.replace(/<script src="[^"]+"><\/script>/g, ""), { url: "https://localhost/", runScripts: "outside-only", pretendToBeVisual: true });
+  const w = dom.window; windows.push(w); w.scrollTo = () => {};
+  w.RALLY_CONFIG = {};
+  w.eval(fs.readFileSync(path.join(www, "vendor", "jspdf.js"), "utf8"));
+  w.eval(fs.readFileSync(path.join(www, "vendor", "jspdf-autotable.js"), "utf8"));
+  let saved = null;
+  w.jspdf.jsPDF.API.save = function (name) { saved = { name, pdf: this.output() }; };
+  w.eval(rules); w.eval(app);
+  await settle();
+  $(w, "#guestBtn").click();
+  $(w, "#newBtn").click();
+  $(w, '[data-best="1"]').click();
+  $(w, "#gA").value = "Maya"; $(w, "#gB").value = "Theo";
+  $(w, "#startBtn").click(); await settle();
+  for (let i = 0; i < 11; i++) tap(w, 0);
+  w.location.hash = "#sheets"; w.dispatchEvent(new w.HashChangeEvent("hashchange"));
+  $(w, "#homeBtn") && $(w, "#homeBtn").click();
+  w.location.hash = "#sheets"; w.dispatchEvent(new w.HashChangeEvent("hashchange"));
+  $(w, "#sheetPdf").click();
+  await settle(10);
+  assert.ok(saved, "PDF was produced; toast: " + $(w, "#toast").textContent + " view: " + text(w).slice(0, 80));
+  assert.match(saved.name, /^rally-history-\d{4}-\d{2}-\d{2}\.pdf$/);
+  assert.ok(saved.pdf.startsWith("%PDF-"));
+  assert.match(saved.pdf, /Maya v Theo/);
+  assert.match(saved.pdf, /11-0/);
 });

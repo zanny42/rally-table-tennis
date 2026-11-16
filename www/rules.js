@@ -108,7 +108,155 @@
 
   const initials = n => String(n || "?").trim().split(/\s+/).map(w => w[0] || "").slice(0, 2).join("").toUpperCase() || "?";
 
-  const api = { keyOf, gameScore, gameOver, serverAt, summarize, switchCount, stats, fromRecord, computeBoard, streakOf, validRecord, toMatch, applyPoint, undoPoint, initials };
+  /* ---------- Tournaments ----------
+     t: {mode: "koth"|"round_robin"|"bracket", crossTeam, draw: "random"|"seeded", seed, status}
+     players: [{id, name, team, position, joinedRound}]
+     matches: [{round, slot, aTp, bTp, games, bestOf, target, status}]
+     Every function is deterministic, so any phone can work out the same next matches. */
+  function prng(seed) { let s = (seed >>> 0) || 0x9e3779b9; return () => { s ^= s << 13; s >>>= 0; s ^= s >>> 17; s ^= s << 5; s >>>= 0; return s / 4294967296; }; }
+  function shuffled(list, seed) { const a = list.slice(), r = prng(seed); for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(r() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; }
+  const byPos = (x, y) => (x.position || 0) - (y.position || 0) || String(x.id).localeCompare(String(y.id));
+  const teamsOf = ps => [...new Set(ps.map(p => (p.team || "").trim()).filter(Boolean))];
+  const crossOn = (t, ps) => !!t.crossTeam && teamsOf(ps).length >= 2;
+  const sameTeam = (a, b) => !!a && !!b && !!(a.team || "").trim() && (a.team || "").trim().toLowerCase() === (b.team || "").trim().toLowerCase();
+
+  /* Pairs players in order; with cross-team on, each player takes the first opponent from another team. */
+  function pairUp(list, cross) {
+    const left = list.slice(), pairs = [];
+    while (left.length > 1) {
+      const p = left.shift();
+      let j = cross ? left.findIndex(q => !sameTeam(p, q)) : -1;
+      if (j < 0) j = 0;
+      pairs.push([p, left.splice(j, 1)[0]]);
+    }
+    return { pairs, rest: left };
+  }
+  function matchWinnerTp(m) {
+    if (!m || m.status !== "done") return null;
+    const s = summarize(toMatch(m.games || [""], m.bestOf, m.target));
+    return s.over ? (s.winner === 0 ? m.aTp : m.bTp) : null;
+  }
+
+  /* Everyone plays everyone, arranged in rounds (circle method). Cross-team keeps only matches between teams. */
+  function roundRobin(t, players) {
+    const ps = players.slice().sort(byPos), cross = crossOn(t, ps), list = ps.slice(), out = [];
+    if (list.length < 2) return out;
+    if (list.length % 2) list.push(null);
+    const n = list.length;
+    for (let r = 0; r < n - 1; r++) {
+      let slot = 0;
+      for (let i = 0; i < n / 2; i++) {
+        const a = list[i], b = list[n - 1 - i];
+        if (a && b && (!cross || !sameTeam(a, b))) out.push({ round: r, slot: slot++, aTp: a.id, bTp: b.id });
+      }
+      list.splice(1, 0, list.pop());
+    }
+    return out;
+  }
+
+  const bitrev = (i, bits) => { let r = 0; for (let b = 0; b < bits; b++) { r = (r << 1) | (i & 1); i >>= 1; } return r; };
+  /* Single-elimination draw. Top seeds (or the first drawn when random) get byes; first-round pairs prefer opposite teams. */
+  function bracketDraw(t, players) {
+    let ps = players.slice().sort(byPos);
+    if (t.draw === "random") ps = shuffled(ps, t.seed);
+    const n = ps.length;
+    if (n < 2) return { size: n, rounds: 0, slots: [] };
+    let size = 1; while (size < n) size *= 2;
+    const byes = size - n, byePlayers = ps.slice(0, byes);
+    let rest = ps.slice(byes);
+    if (t.draw !== "random") { const o = []; for (let i = 0, j = rest.length - 1; i <= j; i++, j--) { o.push(rest[i]); if (i !== j) o.push(rest[j]); } rest = o; }
+    const { pairs } = pairUp(rest, crossOn(t, ps));
+    const items = byePlayers.map(p => [p.id, null]).concat(pairs.map(([a, b]) => [a.id, b.id]));
+    const m = size / 2, bits = Math.round(Math.log2(m)), slots = new Array(m);
+    items.forEach((it, i) => { slots[bitrev(i, bits)] = it; });
+    return { size, rounds: Math.round(Math.log2(size)), slots };
+  }
+  function bracketPlan(t, players, matches) {
+    const d = bracketDraw(t, players), byKey = new Map(matches.map(m => [m.round + ":" + m.slot, m]));
+    const out = [], tree = [];
+    let prev = d.slots.map(s => ({ a: s[0], b: s[1] })), champion = null;
+    for (let r = 0; r < d.rounds; r++) {
+      const winners = [], row = [];
+      prev.forEach((s, k) => {
+        let w = null, bye = false;
+        if (r === 0 && s.a && !s.b) { w = s.a; bye = true; }
+        else if (s.a && s.b) {
+          out.push({ round: r, slot: k, aTp: s.a, bTp: s.b });
+          const m = byKey.get(r + ":" + k);
+          if (m && m.aTp === s.a && m.bTp === s.b) w = matchWinnerTp(m);
+        }
+        row.push({ round: r, slot: k, aTp: s.a || null, bTp: s.b || null, winner: w, bye });
+        winners.push(w);
+      });
+      tree.push(row);
+      if (r === d.rounds - 1) champion = winners[0] || null;
+      prev = [];
+      for (let k = 0; k < winners.length; k += 2) prev.push({ a: winners[k], b: winners[k + 1] });
+    }
+    return { matches: out, champion, tree, size: d.size };
+  }
+
+  /* King of the hill: the winner stays on. Losers go to the back of the queue; with cross-team on,
+     the next challenger is the first in the queue from another team. Late joiners enter the queue
+     at the round they joined. */
+  function kothPlan(t, players, matches) {
+    const ps = players.slice().sort(byPos), cross = crossOn(t, ps), byRound = new Map(matches.map(m => [m.round, m]));
+    const P = id => ps.find(p => p.id === id);
+    const queue = ps.filter(p => !p.joinedRound).map(p => p.id);
+    const st = new Map(ps.map(p => [p.id, { w: 0, l: 0, best: 0, cur: 0 }]));
+    const out = [];
+    let champ = queue.shift() || null, k = 0, open = false;
+    for (;;) {
+      if (k > 0) ps.filter(p => (p.joinedRound || 0) === k).forEach(p => queue.push(p.id));
+      if (!champ || !queue.length) break;
+      const m = byRound.get(k);
+      if (t.status === "done" && !(m && m.status === "done")) break;
+      let j = cross ? queue.findIndex(id => !sameTeam(P(id), P(champ))) : -1;
+      if (j < 0) j = 0;
+      const ch = queue.splice(j, 1)[0];
+      out.push({ round: k, slot: 0, aTp: champ, bTp: ch });
+      const w = m && m.aTp === champ && m.bTp === ch ? matchWinnerTp(m) : null;
+      if (!w) { open = true; queue.unshift(ch); break; }
+      const lo = w === champ ? ch : champ, sw = st.get(w), sl = st.get(lo);
+      sw.w++; sl.l++; sl.cur = 0;
+      sw.cur = w === champ ? sw.cur + 1 : 1; sw.best = Math.max(sw.best, sw.cur);
+      queue.push(lo); champ = w; k++;
+    }
+    ps.filter(p => (p.joinedRound || 0) > k).forEach(p => queue.push(p.id));
+    return { matches: out, champion: champ, streaks: st, queue, nextRound: out.length };
+  }
+
+  function standings(players, matches) {
+    const row = new Map(players.map(p => [p.id, { id: p.id, name: p.name, team: p.team || "", p: 0, w: 0, l: 0, gw: 0, gl: 0, pf: 0, pa: 0 }]));
+    const teams = new Map();
+    for (const m of matches) {
+      const win = matchWinnerTp(m); if (!win) continue;
+      const A = row.get(m.aTp), B = row.get(m.bTp); if (!A || !B) continue;
+      const s = summarize(toMatch(m.games, m.bestOf, m.target));
+      let pa = 0, pb = 0; for (const g of m.games) for (const c of g) c === "0" ? pa++ : pb++;
+      A.p++; B.p++; A.gw += s.gw[0]; A.gl += s.gw[1]; B.gw += s.gw[1]; B.gl += s.gw[0]; A.pf += pa; A.pa += pb; B.pf += pb; B.pa += pa;
+      const W = win === m.aTp ? A : B, L = W === A ? B : A; W.w++; L.l++;
+      if (W.team && L.team && W.team !== L.team) teams.set(W.team, (teams.get(W.team) || 0) + 1);
+    }
+    const list = [...row.values()].sort((x, y) => y.w - x.w || (y.gw - y.gl) - (x.gw - x.gl) || (y.pf - y.pa) - (x.pf - x.pa) || x.name.localeCompare(y.name));
+    const tnames = teamsOf(players);
+    return { players: list, teams: tnames.map(n => ({ team: n, wins: teams.get(n) || 0 })).sort((a, b) => b.wins - a.wins) };
+  }
+
+  /* What should exist now: the matches to create, and whether the tournament is finished. */
+  function tournamentPlan(t, players, matches) {
+    if (t.mode === "round_robin") {
+      const desired = roundRobin(t, players), byKey = new Map(matches.map(m => [m.round + ":" + m.slot, m]));
+      const complete = desired.length > 0 && desired.every(d => matchWinnerTp(byKey.get(d.round + ":" + d.slot)));
+      return { desired, complete, champion: complete ? standings(players, matches).players[0].id : null };
+    }
+    if (t.mode === "bracket") { const b = bracketPlan(t, players, matches); return { desired: b.matches, complete: !!b.champion, champion: b.champion, tree: b.tree }; }
+    const k = kothPlan(t, players, matches);
+    return { desired: k.matches, complete: t.status === "done", champion: k.champion, koth: k };
+  }
+
+  const api = { keyOf, gameScore, gameOver, serverAt, summarize, switchCount, stats, fromRecord, computeBoard, streakOf, validRecord, toMatch, applyPoint, undoPoint, initials,
+    prng, shuffled, pairUp, sameTeam, roundRobin, bracketDraw, bracketPlan, kothPlan, standings, tournamentPlan, matchWinnerTp };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
   else root.RallyRules = api;
 })(typeof window !== "undefined" ? window : globalThis);
