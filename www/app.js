@@ -232,6 +232,7 @@ function vAuth(app) {
   const up = S.authMode === "signup";
   app.innerHTML = `
   <section class="hero" style="min-height:0">
+    <img src="icon.svg" alt="" width="64" height="62" class="r-up" style="display:block;margin-bottom:6px">
     <span class="eyebrow r-up">Table tennis scorer</span>
     <h1 class="r-up d1">Let&#39;s rally.</h1>
     <p class="soft r-up d2" style="margin:0;max-width:290px">Score every point, play with your club, climb the ladder.</p>

@@ -23,6 +23,7 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      - run: npm run config
       - run: npm test
 
   android:
@@ -47,6 +48,7 @@ jobs:
       - name: Add Android platform
         run: |
           npx cap add android
+          npx capacitor-assets generate --android --iconBackgroundColor "#0b0b0d" --iconBackgroundColorDark "#0b0b0d" --splashBackgroundColor "#09090b" --splashBackgroundColorDark "#09090b"
           npx cap sync android
       - name: Build APK
         working-directory: android
@@ -78,6 +80,7 @@ jobs:
       - name: Add iOS platform
         run: |
           npx cap add ios
+          npx capacitor-assets generate --ios --iconBackgroundColor "#0b0b0d" --iconBackgroundColorDark "#0b0b0d" --splashBackgroundColor "#09090b" --splashBackgroundColorDark "#09090b"
           npx cap sync ios
       - name: Build unsigned IPA
         run: |

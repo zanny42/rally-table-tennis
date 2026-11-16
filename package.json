@@ -19,6 +19,7 @@
     "jspdf-autotable": "5.0.9"
   },
   "devDependencies": {
+    "@capacitor/assets": "3.0.5",
     "@capacitor/cli": "7.6.9",
     "jsdom": "27.4.0"
   }
