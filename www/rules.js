@@ -116,17 +116,41 @@
   function prng(seed) { let s = (seed >>> 0) || 0x9e3779b9; return () => { s ^= s << 13; s >>>= 0; s ^= s >>> 17; s ^= s << 5; s >>>= 0; return s / 4294967296; }; }
   function shuffled(list, seed) { const a = list.slice(), r = prng(seed); for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(r() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; }
   const byPos = (x, y) => (x.position || 0) - (y.position || 0) || String(x.id).localeCompare(String(y.id));
-  const teamsOf = ps => [...new Set(ps.map(p => (p.team || "").trim()).filter(Boolean))];
-  const crossOn = (t, ps) => !!t.crossTeam && teamsOf(ps).length >= 2;
-  const sameTeam = (a, b) => !!a && !!b && !!(a.team || "").trim() && (a.team || "").trim().toLowerCase() === (b.team || "").trim().toLowerCase();
+  /* Teams are free text: "Lions ", "lions" and "LIONS" are one team. */
+  const teamKey = p => String((p && p.team) || "").trim().replace(/\s+/g, " ").toLowerCase();
+  /* Distinct teams in first-seen order, shown as first written (trimmed). */
+  const teamsOf = ps => { const seen = new Map(); ps.forEach(p => { const k = teamKey(p); if (k && !seen.has(k)) seen.set(k, String(p.team).trim().replace(/\s+/g, " ")); }); return [...seen.values()]; };
+  /* Cross-team is on by default: only an explicit false/0/"false"/"f"/"no"/"off" turns it off. */
+  const crossFlag = v => v == null ? true : typeof v === "string" ? !/^(false|f|0|no|n|off|)$/i.test(v.trim()) : !!v;
+  const crossOn = (t, ps) => crossFlag(t.crossTeam) && teamsOf(ps).length >= 2;
+  const sameTeam = (a, b) => !!a && !!b && !!teamKey(a) && teamKey(a) === teamKey(b);
 
-  /* Pairs players in order; with cross-team on, each player takes the first opponent from another team. */
+  /* Team sizes, where each player without a team counts as a team of one. */
+  const teamCounts = list => { const c = new Map(); list.forEach(p => { const k = teamKey(p) || "\0" + p.id; c.set(k, (c.get(k) || 0) + 1); }); return c; };
+  /* Fewest same-team pairs possible when pairing everyone in `c` (one sits out if odd): the biggest
+     team's surplus over everyone else has to play itself. */
+  const forcedSame = c => { let r = 0, m = 0; c.forEach(v => { r += v; if (v > m) m = v; }); return Math.max(0, Math.floor((2 * m - r) / 2)); };
+  /* The same after `k` more players sit out, taking them from the biggest team each time (best case). */
+  const forcedAfter = (c, k) => { const a = [...c.values()]; for (; k > 0 && a.length; k--) { let i = 0; a.forEach((v, j) => { if (v > a[i]) i = j; }); a[i]--; } return forcedSame(new Map(a.map((v, i) => [i, v]))); };
+  const without = (c, ...ps) => { const d = new Map(c); ps.forEach(p => { const k = teamKey(p) || "\0" + p.id; d.set(k, d.get(k) - 1); }); return d; };
+
+  /* Pairs players in order. With cross-team on, each player takes the first opponent from another team
+     that still leaves the rest able to pair with the fewest same-team matches possible; a teammate is
+     taken only when no cross-team pairing can avoid it. */
   function pairUp(list, cross) {
     const left = list.slice(), pairs = [];
+    let c = cross ? teamCounts(left) : null;
     while (left.length > 1) {
       const p = left.shift();
-      let j = cross ? left.findIndex(q => !sameTeam(p, q)) : -1;
-      if (j < 0) j = 0;
+      let j = 0;
+      if (cross) {
+        const goal = forcedSame(c), after = q => forcedSame(without(c, p, q));
+        j = left.findIndex(q => !sameTeam(p, q) && after(q) === goal);
+        if (j < 0) j = left.findIndex(q => !sameTeam(p, q) && after(q) <= goal);
+        if (j < 0) j = left.findIndex(q => !sameTeam(p, q));
+        if (j < 0) j = 0;
+        c = without(c, p, left[j]);
+      }
       pairs.push([p, left.splice(j, 1)[0]]);
     }
     return { pairs, rest: left };
@@ -155,17 +179,33 @@
   }
 
   const bitrev = (i, bits) => { let r = 0; for (let b = 0; b < bits; b++) { r = (r << 1) | (i & 1); i >>= 1; } return r; };
-  /* Single-elimination draw. Top seeds (or the first drawn when random) get byes; first-round pairs prefer opposite teams. */
+  /* Single-elimination draw. Top seeds (or the first drawn when random) get byes; first-round pairs prefer opposite teams.
+     With cross-team on, round one has the fewest same-team matches possible (none unless one team outnumbers
+     everyone else). From round two on the bracket is fixed, so two winners from the same team can still meet:
+     that depends on who wins and cannot be ruled out in a knockout. */
   function bracketDraw(t, players) {
     let ps = players.slice().sort(byPos);
     if (t.draw === "random") ps = shuffled(ps, t.seed);
     const n = ps.length;
     if (n < 2) return { size: n, rounds: 0, slots: [] };
     let size = 1; while (size < n) size *= 2;
-    const byes = size - n, byePlayers = ps.slice(0, byes);
-    let rest = ps.slice(byes);
+    const byes = size - n, cross = crossOn(t, ps);
+    /* Byes go to the top seeds (or the first drawn), except that with cross-team on a bye is passed
+       down to the next player whenever giving it would leave more teammates forced to meet in round one. */
+    let byePlayers = ps.slice(0, byes), rest = ps.slice(byes);
+    if (cross && byes) {
+      byePlayers = []; rest = ps.slice();
+      let c = teamCounts(rest);
+      for (let k = byes; k > 0; k--) {
+        const goal = forcedAfter(c, k);
+        let i = rest.findIndex(p => forcedAfter(without(c, p), k - 1) === goal);
+        if (i < 0) i = 0;
+        c = without(c, rest[i]);
+        byePlayers.push(rest.splice(i, 1)[0]);
+      }
+    }
     if (t.draw !== "random") { const o = []; for (let i = 0, j = rest.length - 1; i <= j; i++, j--) { o.push(rest[i]); if (i !== j) o.push(rest[j]); } rest = o; }
-    const { pairs } = pairUp(rest, crossOn(t, ps));
+    const { pairs } = pairUp(rest, cross);
     const items = byePlayers.map(p => [p.id, null]).concat(pairs.map(([a, b]) => [a.id, b.id]));
     const m = size / 2, bits = Math.round(Math.log2(m)), slots = new Array(m);
     items.forEach((it, i) => { slots[bitrev(i, bits)] = it; });
@@ -236,11 +276,12 @@
       let pa = 0, pb = 0; for (const g of m.games) for (const c of g) c === "0" ? pa++ : pb++;
       A.p++; B.p++; A.gw += s.gw[0]; A.gl += s.gw[1]; B.gw += s.gw[1]; B.gl += s.gw[0]; A.pf += pa; A.pa += pb; B.pf += pb; B.pa += pa;
       const W = win === m.aTp ? A : B, L = W === A ? B : A; W.w++; L.l++;
-      if (W.team && L.team && W.team !== L.team) teams.set(W.team, (teams.get(W.team) || 0) + 1);
+      const wk = teamKey(W), lk = teamKey(L);
+      if (wk && lk && wk !== lk) teams.set(wk, (teams.get(wk) || 0) + 1);
     }
     const list = [...row.values()].sort((x, y) => y.w - x.w || (y.gw - y.gl) - (x.gw - x.gl) || (y.pf - y.pa) - (x.pf - x.pa) || x.name.localeCompare(y.name));
     const tnames = teamsOf(players);
-    return { players: list, teams: tnames.map(n => ({ team: n, wins: teams.get(n) || 0 })).sort((a, b) => b.wins - a.wins) };
+    return { players: list, teams: tnames.map(n => ({ team: n, wins: teams.get(teamKey({ team: n })) || 0 })).sort((a, b) => b.wins - a.wins) };
   }
 
   /* What should exist now: the matches to create, and whether the tournament is finished. */
