@@ -50,7 +50,7 @@ let seq = 0;
 const uuid = () => "00000000-0000-4000-8000-" + (++seq).toString(16).padStart(12, "0");
 const clone = x => x == null ? x : JSON.parse(JSON.stringify(x));
 function makeBackend() {
-  const db = { profiles: [], live_matches: [], matches: [], tournaments: [], tournament_players: [], match_keepers: [], tournament_keepers: [] };
+  const db = { profiles: [], live_matches: [], matches: [], tournaments: [], tournament_players: [], match_keepers: [], tournament_keepers: [], club_admins: [] };
   const users = new Map(), subs = [], rpcLog = [];
   let code = 4820;
   const B = { db, users, rpcLog, rpcHook: null, confirmEmail: false };
@@ -84,7 +84,7 @@ function makeBackend() {
     live_matches: uid => ({ id: uuid(), owner: uid, games: [""], status: "live", version: 0, join_code: String(code++), started_at: new Date().toISOString(), updated_at: new Date().toISOString(), ended_at: null, tournament_id: null, round: null, slot: null, a_tp: null, b_tp: null, a_user: null, b_user: null, keepers: "players", first_server: 0, target: 11, best_of: 3, kind: "singles", a2_name: null, b2_name: null, picks: [] }),
     tournaments: uid => ({ id: uuid(), owner: uid, seed: 987654321, join_code: String(code++), status: "live", champion: null, created_at: new Date().toISOString(), ended_at: null, cross_team: false, draw: "random", best_of: 1, target: 11 }),
     tournament_players: () => ({ id: uuid(), joined_round: 0, user_id: null, team: "", position: 0 }),
-    profiles: () => ({}), matches: () => ({}), match_keepers: () => ({}), tournament_keepers: () => ({})
+    profiles: () => ({}), matches: () => ({}), club_admins: () => ({}), match_keepers: () => ({}), tournament_keepers: () => ({})
   };
   const insertCheck = (table, row, uid) => {
     if (!uid) return { code: "42501", message: "new row violates row-level security policy" };
@@ -102,15 +102,21 @@ function makeBackend() {
     return null;
   };
   const mayUpdate = (table, r, uid) => !!uid && (table === "tournaments" ? isTKeeper(uid, r.id) : table === "profiles" ? r.id === uid : table === "tournament_players" ? isTKeeper(uid, r.tournament_id) : false);
-  const mayDelete = (table, r, uid) => !!uid && (table === "live_matches" ? (r.owner === uid || (r.tournament_id && r.games.join("") === "" && isTKeeper(uid, r.tournament_id)))
-    : table === "matches" ? r.by === uid : table === "tournaments" ? r.owner === uid : table === "tournament_players" ? isTKeeper(uid, r.tournament_id) : false);
+  // mirrors supabase/rally6_delete.sql
+  const isAdmin = uid => db.club_admins.some(a => a.user_id === uid);
+  const mayDelete = (table, r, uid) => !!uid && (table === "live_matches" ? (r.owner === uid || (r.tournament_id && r.games.join("") === "" && isTKeeper(uid, r.tournament_id))
+        || (!r.tournament_id && (isAdmin(uid) || (r.status === "done" && (r.a_user === uid || r.b_user === uid)))))
+    : table === "matches" ? ((r.by === uid || isAdmin(uid) || db.live_matches.some(m => m.id === r.id && !m.tournament_id && [m.owner, m.a_user, m.b_user].includes(uid)))
+        && !(r.data && r.data.tournamentId && db.tournaments.some(t => t.id === r.data.tournamentId)))
+    : table === "tournaments" ? (r.owner === uid || isAdmin(uid)) : table === "tournament_players" ? isTKeeper(uid, r.tournament_id) : false);
   const removeRows = (table, pred) => {
     const gone = db[table].filter(pred); db[table] = db[table].filter(r => !pred(r));
     for (const r of gone) {
       emit(table, "DELETE", null, { id: r.id }); // default replica identity: only the primary key in old
       if (table === "tournaments") { removeRows("live_matches", m => m.tournament_id === r.id); removeRows("tournament_players", p => p.tournament_id === r.id); db.tournament_keepers = db.tournament_keepers.filter(k => k.tournament_id !== r.id); }
       if (table === "tournament_players") removeRows("live_matches", m => m.a_tp === r.id || m.b_tp === r.id);
-      if (table === "live_matches") db.match_keepers = db.match_keepers.filter(k => k.match_id !== r.id);
+      if (table === "live_matches") { db.match_keepers = db.match_keepers.filter(k => k.match_id !== r.id); db.matches = db.matches.filter(x => x.id !== r.id); }
+      if (table === "tournaments") db.matches = db.matches.filter(x => !(x.data && x.data.tournamentId === r.id));
     }
     return gone;
   };
@@ -137,7 +143,7 @@ function makeBackend() {
         let data = null;
         if (st.op === "select") {
           if (!me && table !== "matches") data = [];
-          else data = db[table].filter(match).map(clone);
+          else data = db[table].filter(match).filter(r => table !== "club_admins" || r.user_id === me).map(clone);
           for (const [c, asc] of st.orders.slice().reverse()) data.sort((x, y) => (x[c] > y[c] ? 1 : x[c] < y[c] ? -1 : 0) * (asc ? 1 : -1));
           if (st.lim != null) data = data.slice(0, st.lim);
         } else if (st.op === "insert" || st.op === "upsert") {
@@ -1417,4 +1423,125 @@ test("doubles: undo across a game boundary keeps the chosen server for the next 
   assert.equal(sheetText(w), "", "the server for game 2 was already chosen");
   assert.equal(servingName(w), "Kai");
   healthy(w);
+});
+
+/* ================================================================
+   DELETING MATCHES AND TOURNAMENTS
+   ================================================================ */
+async function finishClubMatch(w, opp) {
+  const id = await clubStart(w, { opp, bestOf: 1 });
+  for (let i = 0; i < 11; i++) tap(w, 0);
+  await wait(400);
+  click(w, "#homeBtn"); await tick();
+  return id;
+}
+async function selectAndDelete(w, ids) {
+  click(w, "#selStart"); await tick();
+  for (const id of ids) click(w, `.sheetcard[data-id="${id}"]`);
+  click(w, "#selDel"); await tick();
+  assert.match($(w, "#selDel").textContent, /Tap again/);
+  click(w, "#selDel"); await wait(400);
+}
+
+test("delete: a player deletes a club match from Score sheets and it leaves every phone's ladder", async () => {
+  const { B, maya, theo } = club();
+  const a = await signedPhone(B, maya), b = await signedPhone(B, theo);
+  const id = await finishClubMatch(a, theo.id);
+  assert.equal(B.db.matches.length, 1);
+  await go(a, "#ladder"); assert.match(text(a), /Maya\s*1020/);
+  await go(b, "#sheets"); await wait(200);
+  assert.ok($(b, "#selStart"), "Theo played in it, so he can select it");
+  await selectAndDelete(b, [id]);
+  assert.match($(b, "#toast").textContent, /Deleted 1 match/);
+  assert.equal(B.db.matches.length, 0, "ladder result gone from the server");
+  assert.equal(B.db.live_matches.length, 0, "match record gone too");
+  assert.match(text(b), /No sheets yet/);
+  await wait(400);
+  assert.doesNotMatch(text(a), /Maya\s*1020/, "Maya's open ladder drops it without a reload");
+  assert.match(text(a), /The ladder is empty/);
+  healthy(a, b);
+});
+
+test("delete: someone who did not play cannot delete a match; the club admin can", async () => {
+  const { B, maya, theo, priya } = club();
+  const a = await signedPhone(B, maya);
+  const id = await finishClubMatch(a, theo.id);
+  const p = await signedPhone(B, priya);
+  await go(p, "#sheets"); await wait(200);
+  assert.match(text(p), /Maya/);
+  assert.equal($(p, "#selStart"), null, "nothing Priya may delete, so no Select button");
+  click(p, `.sheetcard[data-id="${id}"]`); await tick();
+  assert.equal($(p, "#delRec"), null, "no delete link on the report either");
+  // the server refuses even a forced delete
+  const r = await B.client({ as: priya }).from("live_matches").delete().eq("id", id).select("id");
+  assert.equal(r.data.length, 0);
+  assert.equal(B.db.matches.length, 1);
+  B.db.club_admins.push({ user_id: priya.id });
+  const p2 = await signedPhone(B, priya);
+  await go(p2, "#sheets"); await wait(200);
+  click(p2, `.sheetcard[data-id="${id}"]`); await tick();
+  click(p2, "#delRec"); click(p2, "#delRec"); await wait(400);
+  assert.match($(p2, "#toast").textContent, /Match deleted/);
+  assert.equal(B.db.matches.length, 0);
+  healthy(a, p, p2);
+});
+
+test("delete: a guest selects several matches on the phone and deletes them at once", async () => {
+  const w = await guestPhone();
+  for (const [x, y] of [["Ana", "Ben"], ["Cy", "Di"], ["Ed", "Flo"]]) { await guestStart(w, x, y, 1); for (let i = 0; i < 11; i++) tap(w, 0); click(w, "#homeBtn"); await tick(); }
+  await go(w, "#sheets");
+  const ids = JSON.parse(w.localStorage.getItem("rally.local")).map(r => r.id);
+  assert.equal(ids.length, 3);
+  click(w, "#selStart"); await tick();
+  click(w, "#selAll"); await tick();
+  assert.match(text(w), /3 selected/);
+  click(w, `.sheetcard[data-id="${ids[1]}"]`); await tick();
+  assert.match(text(w), /2 selected/);
+  click(w, "#selDel"); click(w, "#selDel"); await wait(200);
+  assert.match($(w, "#toast").textContent, /Deleted 2 matches/);
+  assert.equal(JSON.stringify(JSON.parse(w.localStorage.getItem("rally.local")).map(r => r.id)), JSON.stringify([ids[1]]));
+  assert.match(text(w), /Cy/); assert.doesNotMatch(text(w), /Ana/);
+  // Cancel leaves select mode without deleting
+  click(w, "#selStart"); click(w, "#selAll"); click(w, "#selDone"); await tick();
+  assert.match(text(w), /Score sheets/);
+  assert.equal(JSON.parse(w.localStorage.getItem("rally.local")).length, 1);
+  healthy(w);
+});
+
+function seedTournament(B, owner, name) {
+  const t = { id: "t-" + name, owner, name, mode: "round_robin", cross_team: false, draw: "random", seed: 1, best_of: 1, target: 11, join_code: "55" + name.length, status: "done", champion: null, created_at: new Date().toISOString(), ended_at: new Date().toISOString() };
+  B.db.tournaments.push(t);
+  B.db.matches.push({ id: "r-" + name, by: owner, ended_at: Date.now(), data: { a: "Ana", b: "Ben", aKey: "ana", bKey: "ben", bestOf: 1, target: 11, firstServer: 0, g: ["00000000000"], winner: 0, gw: [1, 0], startedAt: Date.now() - 60000, endedAt: Date.now(), tournament: name, tournamentId: t.id } });
+  return t;
+}
+test("delete: the host deletes tournaments from the list, with their results; others cannot, the admin can", async () => {
+  const { B, maya, theo, priya } = club();
+  seedTournament(B, maya.id, "Spring"); seedTournament(B, maya.id, "Summer"); seedTournament(B, theo.id, "Theos");
+  const a = await signedPhone(B, maya);
+  await go(a, "#ladder"); assert.match(text(a), /Ana/);
+  // a tournament match can't be deleted on its own while the tournament exists
+  await go(a, "#sheets"); click(a, '.sheetcard[data-id="r-Spring"]'); await tick();
+  assert.equal($(a, "#delRec"), null);
+  click(a, "#closeRep"); await tick();
+  await go(a, "#cups"); await wait(100);
+  click(a, "#cSel"); await tick();
+  assert.ok($(a, '[data-tour="t-Theos"]').disabled, "Theo's tournament is not Maya's to delete");
+  click(a, '[data-tour="t-Spring"]'); click(a, '[data-tour="t-Summer"]');
+  assert.match(text(a), /2 selected/);
+  click(a, "#cDel"); assert.match($(a, "#cDel").textContent, /Tap again/);
+  click(a, "#cDel"); await wait(400);
+  assert.match($(a, "#toast").textContent, /Deleted 2 tournaments/);
+  assert.equal(JSON.stringify(B.db.tournaments.map(t => t.id)), JSON.stringify(["t-Theos"]));
+  assert.equal(B.db.matches.length, 1, "their ladder results went with them");
+  const p = await signedPhone(B, priya);
+  await go(p, "#cups"); await wait(100);
+  assert.equal($(p, "#cSel"), null, "Priya hosts nothing and is not admin");
+  B.db.club_admins.push({ user_id: priya.id });
+  const p2 = await signedPhone(B, priya);
+  await go(p2, "#cups"); await wait(100);
+  click(p2, '[data-tour="t-Theos"]'); await wait(200);
+  click(p2, "#tDel"); click(p2, "#tDel"); await wait(400);
+  assert.match($(p2, "#toast").textContent, /Tournament deleted/);
+  assert.equal(B.db.tournaments.length, 0); assert.equal(B.db.matches.length, 0);
+  healthy(a, p, p2);
 });

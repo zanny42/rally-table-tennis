@@ -146,6 +146,9 @@ function onLiveChange(p) {
     S.live = S.live.filter(m => m.id !== id);
     if (S.game && S.game.id === id) { S.game = null; toast("The host removed this match."); }
     if (S.tour && S.tour.matches.some(m => m.id === id)) { S.tour.matches = S.tour.matches.filter(m => m.id !== id); soonReconcile(S.tour.t.id); }
+    // a finished match deleted on another phone takes its ladder result with it
+    if (S.ladder.some(m => m.id === id)) { S.ladder = S.ladder.filter(m => m.id !== id); loadLadder().then(() => render(true)); }
+    if (S.report && S.report.id === id && !S.report.local) { S.report = null; if (S.screen === "report") S.screen = null; }
     return render(true);
   }
   if (!p.new || !p.new.id) return;
@@ -185,12 +188,12 @@ async function initAuth() {
 async function afterAuth() {
   if (uid()) {
     S.guest = false; LS.set("rally.guest", false);
-    await Promise.all([loadProfiles(), loadLadder(), loadLive(), loadTournaments(), loadTKeepers()]);
+    await Promise.all([loadProfiles(), loadLadder(), loadLive(), loadTournaments(), loadTKeepers(), loadAdmin()]);
     pruneLive();
     subscribe();
   } else {
     if (channel) { try { sb.removeChannel(channel); } catch (e) {} channel = null; }
-    S.me = null; S.live = [];
+    S.me = null; S.live = []; S.admin = false; S.sheetSel = null;
     await loadLadder();
   }
   S.booted = true; render();
@@ -262,7 +265,7 @@ function render(keep) {
   else if (S.screen === "tnew") view = "tnew";
   else if (S.screen === "tour" && S.tour) view = "tour";
   else view = route();
-  if (view !== S.lastView) { window.scrollTo(0, 0); viewAt = performance.now(); }
+  if (view !== S.lastView) { window.scrollTo(0, 0); viewAt = performance.now(); S.sheetSel = null; S.sheetArm = false; S.cupSel = null; S.cupArm = false; }
   S.lastView = view;
   const tabbed = TABS.includes(view);
   app.classList.toggle("full", !tabbed);
@@ -786,7 +789,7 @@ function vReport(app) {
   const w = rec.winner, wn = w ? rec.b : rec.a, wKey = w ? rec.bKey : rec.aKey, wp = board.byKey.get(wKey);
   const scores = (rec.g || []).map(s => R.gameScore([...s].map(Number)));
   const top = Math.max(11, ...scores.flat());
-  const canDel = rec.local || (uid() && rec.by === uid());
+  const canDel = canDeleteRec(rec);
   if (!paint(app, `
   <header class="row"><button class="icon-btn" id="closeRep" aria-label="Close">${ICON.close}</button><span style="flex:1;text-align:center;font-size:17px;font-weight:600">Match report</span><span style="width:46px"></span></header>
   <div class="r-up" style="padding:6px 4px 2px"><span style="font-size:14px;color:#ffd2bf">${fmtDate(rec.endedAt)} · ${fmtDur(rec.endedAt - rec.startedAt)}</span>
@@ -826,13 +829,9 @@ function vReport(app) {
     let armed = false;
     $("#delRec").onclick = async e => {
       if (!armed) { armed = true; e.currentTarget.textContent = rec.local ? "Tap again to delete" : "Tap again to delete for everyone"; return; }
-      if (rec.local) { S.local = S.local.filter(x => x.id !== rec.id); LS.set("rally.local", S.local); }
-      else {
-        const { error } = await sb.from("matches").delete().eq("id", rec.id);
-        if (error) return toast("Couldn't delete this match.");
-        await sb.from("live_matches").delete().eq("id", rec.id);
-        await loadLadder();
-      }
+      e.currentTarget.disabled = true;
+      const r = await deleteRecords([rec]);
+      if (!r.ok) { e.currentTarget.disabled = false; armed = false; e.currentTarget.textContent = "Delete this match"; return toast("Couldn't delete this match. Only the host, the players or the club admin can."); }
       S.screen = null; S.report = null; render(); toast("Match deleted");
     };
   }
@@ -869,15 +868,81 @@ function openPlayer(k) {
     <div class="card pad" style="display:flex;flex-direction:column;gap:6px"><span class="small muted">Head to head</span>${opp.map(o => `<div class="between"><span>v ${esc(o.name)}</span><b>${o.w}–${o.l}</b></div>`).join("")}</div>
     <div class="card pad" style="display:flex;flex-direction:column;gap:6px"><span class="small muted">Recent</span>${recent.map(m => { const me = m.aKey === k ? 0 : 1, dd = (deltas.get(m.id) || [0, 0])[me]; return `<div class="between"><span>${m.winner === me ? "Beat" : "Lost to"} ${esc(me ? m.a : m.b)} ${m.gw[me]}–${m.gw[1 - me]}</span><span class="${dd >= 0 ? "up" : "down"}">${sign(dd)}</span></div>`; }).join("")}</div>`);
 }
+/* ---------- deleting finished matches ----------
+   Who may delete (the server checks the same): matches on this phone always; a club match by whoever started it,
+   either player on it, or a club admin. A tournament's matches go when the tournament is deleted. */
+async function loadAdmin() {
+  S.admin = false;
+  if (!sb || !uid()) return;
+  // a server without the admin table (older setup) just means nobody is admin
+  try {
+    const { data, error } = await sb.from("club_admins").select("user_id").eq("user_id", uid());
+    S.admin = !error && Array.isArray(data) && data.length > 0;
+  } catch (e) { S.admin = false; }
+}
+function canDeleteRec(rec) {
+  if (!rec) return false;
+  if (rec.local) return true;
+  if (!uid()) return false;
+  if (rec.tournamentId && S.tournaments.some(t => t.id === rec.tournamentId)) return false;
+  return rec.by === uid() || S.admin || sideOf(rec, R.keyOf(myName())) >= 0;
+}
+async function deleteRecords(recs) {
+  let ok = 0, failed = 0;
+  const local = recs.filter(r => r.local);
+  if (local.length) {
+    const ids = new Set(local.map(r => r.id));
+    S.local = S.local.filter(x => !ids.has(x.id)); LS.set("rally.local", S.local); ok += local.length;
+  }
+  const remote = recs.filter(r => !r.local);
+  for (const r of remote) {
+    // deleting the match also deletes its ladder result; an old result with no match row is deleted directly
+    const a = await sb.from("live_matches").delete().eq("id", r.id).select("id");
+    let gone = !a.error && Array.isArray(a.data) && a.data.length > 0;
+    if (!gone) { const b = await sb.from("matches").delete().eq("id", r.id).select("id"); gone = !b.error && Array.isArray(b.data) && b.data.length > 0; }
+    if (gone) { ok++; S.live = S.live.filter(m => m.id !== r.id); } else failed++;
+  }
+  if (remote.length) await loadLadder();
+  return { ok, failed };
+}
+const plural = (n, one, many) => n + " " + (n === 1 ? one : many);
+
 function vSheets(app) {
-  const fin = finished().slice().reverse();
-  if (!paint(app, `<header class="between r-up"><h1 style="font-size:28px">Score sheets</h1>${fin.length ? `<button class="btn small ghost" id="sheetPdf">${ICON.share.replace("<svg ", '<svg width="18" height="18" ')}PDF</button>` : `<span class="small muted">Newest first</span>`}</header>
-  ${fin.length ? `<div class="r-up d1" style="display:flex;flex-direction:column;gap:10px">${fin.map(m => `<button class="card sheetcard" data-id="${esc(m.id)}"><span class="between small muted"><span>${fmtDate(m.endedAt)}${m.local ? " · this phone" : ""}</span><span>${m.bestOf === 1 ? "1 game" : "Best of " + m.bestOf}</span></span>
+  const fin = finished().slice().reverse(), sel = S.sheetSel;
+  if (sel) for (const id of [...sel]) if (!fin.some(m => m.id === id)) sel.delete(id);
+  const deletable = fin.filter(canDeleteRec);
+  const n = sel ? sel.size : 0, armed = S.sheetArm && n > 0;
+  const head = !fin.length ? `<span class="small muted">Newest first</span>`
+    : sel ? `<span class="row" style="gap:8px"><button class="btn small ghost" id="selAll">${n === deletable.length && n ? "None" : "All"}</button><button class="btn small ghost" id="selDone">Cancel</button></span>`
+    : `<span class="row" style="gap:8px">${deletable.length ? `<button class="btn small ghost" id="selStart">Select</button>` : ""}<button class="btn small ghost" id="sheetPdf">${ICON.share.replace("<svg ", '<svg width="18" height="18" ')}PDF</button></span>`;
+  const card = m => {
+    const can = canDeleteRec(m), on = sel && sel.has(m.id);
+    return `<button class="card sheetcard${sel ? " selecting" : ""}${on ? " picked" : ""}" data-id="${esc(m.id)}" ${sel ? `aria-pressed="${!!on}"` : ""} ${sel && !can ? "disabled" : ""}>
+    <span class="between small muted"><span>${sel ? `<span class="tick" aria-hidden="true">${on ? "✓" : ""}</span>` : ""}${fmtDate(m.endedAt)}${m.local ? " · this phone" : ""}${isDbl(m) ? " · doubles" : ""}</span><span>${sel && !can ? (m.tournamentId ? "In a tournament" : "Not yours") : m.bestOf === 1 ? "1 game" : "Best of " + m.bestOf}</span></span>
     <span class="between"><span style="font-weight:${m.winner === 0 ? 700 : 500};min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(m.a)}</span><span class="num" style="font-size:28px">${m.gw[0]}–${m.gw[1]}</span><span style="font-weight:${m.winner === 1 ? 700 : 500};min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:right">${esc(m.b)}</span></span>
-    <span class="gpills">${(m.g || []).map(s => { const [a, b] = R.gameScore([...s].map(Number)); return `<span>${a}–${b}</span>`; }).join("")}</span></button>`).join("")}</div>`
-    : `<div class="card empty r-up d1"><b>No sheets yet</b>Every match you finish gets a score sheet here.</div>`}`)) return;
-  app.querySelectorAll("[data-id]").forEach(b => b.onclick = () => { S.report = finished().find(x => x.id === b.dataset.id); S.screen = "report"; render(); });
+    <span class="gpills">${(m.g || []).map(s => { const [a, b] = R.gameScore([...s].map(Number)); return `<span>${a}–${b}</span>`; }).join("")}</span></button>`;
+  };
+  if (!paint(app, `<header class="between r-up"><h1 style="font-size:28px">${sel ? plural(n, "selected", "selected") : "Score sheets"}</h1>${head}</header>
+  ${fin.length ? `<div class="r-up d1" style="display:flex;flex-direction:column;gap:10px${sel ? ";padding-bottom:84px" : ""}">${fin.map(card).join("")}</div>`
+    : `<div class="card empty r-up d1"><b>No sheets yet</b>Every match you finish gets a score sheet here.</div>`}
+  ${sel ? `<div class="selbar"><button class="btn${armed ? " danger" : ""}" id="selDel" ${n ? "" : "disabled"}>${armed ? `Tap again to delete ${plural(n, "match", "matches")} for good` : `Delete ${plural(n, "match", "matches")}`}</button></div>` : ""}`)) return;
+  app.querySelectorAll("[data-id]").forEach(b => b.onclick = () => {
+    if (!S.sheetSel) { S.report = finished().find(x => x.id === b.dataset.id); S.screen = "report"; return render(); }
+    const id = b.dataset.id; if (S.sheetSel.has(id)) S.sheetSel.delete(id); else S.sheetSel.add(id);
+    S.sheetArm = false; render(true);
+  });
   if ($("#sheetPdf")) $("#sheetPdf").onclick = () => exportHistoryPdf(finished(), "Match history");
+  if ($("#selStart")) $("#selStart").onclick = () => { S.sheetSel = new Set(); S.sheetArm = false; render(true); };
+  if ($("#selDone")) $("#selDone").onclick = () => { S.sheetSel = null; S.sheetArm = false; render(true); };
+  if ($("#selAll")) $("#selAll").onclick = () => { S.sheetSel = n === deletable.length ? new Set() : new Set(deletable.map(m => m.id)); S.sheetArm = false; render(true); };
+  if ($("#selDel")) $("#selDel").onclick = async () => {
+    if (!S.sheetArm) { S.sheetArm = true; return render(true); }
+    const recs = finished().filter(m => S.sheetSel.has(m.id));
+    $("#selDel").disabled = true; $("#selDel").textContent = "Deleting…";
+    const r = await deleteRecords(recs);
+    S.sheetSel = null; S.sheetArm = false; render(true);
+    toast(r.failed ? `Deleted ${r.ok}. ${plural(r.failed, "match", "matches")} couldn't be deleted.` : `Deleted ${plural(r.ok, "match", "matches")}`);
+  };
 }
 function vYou(app) {
   const me = myName(), key = R.keyOf(me || ""), p = key ? boardOf("singles").byKey.get(key) : null;
@@ -1068,18 +1133,43 @@ function vCups(app) {
     if ($("#toSignIn2")) $("#toSignIn2").onclick = () => { S.guest = false; LS.set("rally.guest", false); render(); };
     return;
   }
+  const canDelT = t => t.owner === uid() || S.admin;
+  const sel = S.cupSel;
+  if (sel) for (const id of [...sel]) if (!S.tournaments.some(t => t.id === id)) sel.delete(id);
+  const n = sel ? sel.size : 0, armed = S.cupArm && n > 0, deletable = S.tournaments.filter(canDelT);
   const live = S.tournaments.filter(t => t.status === "live"), done = S.tournaments.filter(t => t.status !== "live");
-  const card = (t, i) => `<button class="card pad r-up d${Math.min(5, i + 2)}" data-tour="${esc(t.id)}" style="display:flex;flex-direction:column;gap:6px;text-align:left;width:100%;${t.status === "live" ? "border-color:rgba(255,90,31,.4)" : ""}">
-      <span class="between"><b style="font-size:17px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(t.name)}</b><span class="tag ${t.status === "live" ? "" : "ghost"}" style="flex:none">${t.status === "live" ? "Live" : "Finished"}</span></span>
-      <span class="small muted">${MODE[t.mode][0]} · ${fmtFormat(t.bestOf, t.target)} · ${fmtDate(t.createdAt)}</span></button>`;
-  app.innerHTML = `<header class="between r-up"><h1 style="font-size:28px">Tournaments</h1><button class="icon-btn" id="tJoinBtn" aria-label="Join a tournament with a code">${ICON.key}</button></header>
-    <button class="btn r-up d1" id="tNewBtn">${ICON.plus}Host a tournament</button>
+  const card = (t, i) => { const on = sel && sel.has(t.id), can = canDelT(t);
+    return `<button class="card pad r-up d${Math.min(5, i + 2)}${on ? " picked" : ""}" data-tour="${esc(t.id)}" ${sel ? `aria-pressed="${!!on}"` : ""} ${sel && !can ? "disabled" : ""} style="display:flex;flex-direction:column;gap:6px;text-align:left;width:100%;${t.status === "live" ? "border-color:rgba(255,90,31,.4)" : ""}">
+      <span class="between"><b style="font-size:17px;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${sel ? `<span class="tick" aria-hidden="true">${on ? "✓" : ""}</span>` : ""}${esc(t.name)}</b><span class="tag ${t.status === "live" ? "" : "ghost"}" style="flex:none">${sel && !can ? "Not yours" : t.status === "live" ? "Live" : "Finished"}</span></span>
+      <span class="small muted">${MODE[t.mode][0]} · ${fmtFormat(t.bestOf, t.target)} · ${fmtDate(t.createdAt)}</span></button>`; };
+  const head = sel ? `<span class="row" style="gap:8px"><button class="btn small ghost" id="cAll">${n === deletable.length && n ? "None" : "All"}</button><button class="btn small ghost" id="cDone">Cancel</button></span>`
+    : `<span class="row" style="gap:8px">${deletable.length ? `<button class="btn small ghost" id="cSel">Select</button>` : ""}<button class="icon-btn" id="tJoinBtn" aria-label="Join a tournament with a code">${ICON.key}</button></span>`;
+  app.innerHTML = `<header class="between r-up"><h1 style="font-size:28px">${sel ? n + " selected" : "Tournaments"}</h1>${head}</header>
+    ${sel ? "" : `<button class="btn r-up d1" id="tNewBtn">${ICON.plus}Host a tournament</button>`}
     ${live.length ? `<div class="sec r-up d2"><h2>Live</h2></div>${live.map(card).join("")}` : ""}
     ${done.length ? `<div class="sec r-up d3"><h2>Finished</h2></div>${done.map(card).join("")}` : ""}
-    ${!S.tournaments.length ? `<div class="card empty r-up d2"><b>No tournaments yet</b>Host one for your club, or put two teams head to head.</div>` : ""}`;
-  $("#tNewBtn").onclick = () => { S.screen = "tnew"; render(); }; // a half-made tournament is picked up where it was left
-  $("#tJoinBtn").onclick = openTourJoin;
-  app.querySelectorAll("[data-tour]").forEach(b => b.onclick = () => openTour(b.dataset.tour));
+    ${!S.tournaments.length ? `<div class="card empty r-up d2"><b>No tournaments yet</b>Host one for your club, or put two teams head to head.</div>` : ""}
+    ${sel ? `<div style="height:84px"></div><div class="selbar"><button class="btn${armed ? " danger" : ""}" id="cDel" ${n ? "" : "disabled"}>${armed ? `Tap again: delete ${plural(n, "tournament", "tournaments")} and their results for good` : `Delete ${plural(n, "tournament", "tournaments")}`}</button></div>` : ""}`;
+  if ($("#tNewBtn")) $("#tNewBtn").onclick = () => { S.screen = "tnew"; render(); }; // a half-made tournament is picked up where it was left
+  if ($("#tJoinBtn")) $("#tJoinBtn").onclick = openTourJoin;
+  if ($("#cSel")) $("#cSel").onclick = () => { S.cupSel = new Set(); S.cupArm = false; render(true); };
+  if ($("#cDone")) $("#cDone").onclick = () => { S.cupSel = null; S.cupArm = false; render(true); };
+  if ($("#cAll")) $("#cAll").onclick = () => { S.cupSel = n === deletable.length ? new Set() : new Set(deletable.map(t => t.id)); S.cupArm = false; render(true); };
+  app.querySelectorAll("[data-tour]").forEach(b => b.onclick = () => {
+    if (!S.cupSel) return openTour(b.dataset.tour);
+    const id = b.dataset.tour; if (S.cupSel.has(id)) S.cupSel.delete(id); else S.cupSel.add(id);
+    S.cupArm = false; render(true);
+  });
+  if ($("#cDel")) $("#cDel").onclick = async () => {
+    if (!S.cupArm) { S.cupArm = true; return render(true); }
+    const ids = [...S.cupSel];
+    $("#cDel").disabled = true; $("#cDel").textContent = "Deleting…";
+    let ok = 0;
+    for (const id of ids) { const { data, error } = await sb.from("tournaments").delete().eq("id", id).select("id"); if (!error && Array.isArray(data) && data.length) ok++; }
+    S.cupSel = null; S.cupArm = false;
+    await Promise.all([loadTournaments(), loadLadder(), loadLive()]); pruneLive(); render(true);
+    toast(ok < ids.length ? `Deleted ${ok}. ${plural(ids.length - ok, "tournament", "tournaments")} couldn't be deleted.` : `Deleted ${plural(ok, "tournament", "tournaments")}`);
+  };
 }
 
 const newDraft = () => ({ name: "", mode: "bracket", draw: "random", crossTeam: true, bestOf: 1, target: 11, teams: [], team: "", players: [], newName: "", newTeam: "" });
@@ -1250,7 +1340,7 @@ function openTourMatch(id) {
   S.game = Object.assign({}, m, { flip: 0 }); render();
 }
 function vTour(app) {
-  const T = S.tour, t = T.t, plan = planOf(T), keeper = isTKeeper(t.id), owner = t.owner === uid(), on = t.status === "live";
+  const T = S.tour, t = T.t, plan = planOf(T), keeper = isTKeeper(t.id), owner = t.owner === uid() || S.admin, on = t.status === "live";
   const teams = teamList(T), st = R.standings(T.players, T.matches);
   const byKey = new Map(T.matches.map(m => [tkey(m), m])), at = d => slotMatch(byKey, d);
   const live = plan.desired.map(at).filter(m => m && m.status === "live");
@@ -1335,8 +1425,8 @@ function vTour(app) {
     await reconcile(t.id); await loadTournaments(); render(true); toast("Tournament finished");
   });
   if ($("#tDel")) $("#tDel").onclick = arm("del", async () => {
-    const { error } = await sb.from("tournaments").delete().eq("id", t.id);
-    if (error) { render(true); return toast("Couldn't delete the tournament."); }
+    const { data, error } = await sb.from("tournaments").delete().eq("id", t.id).select("id");
+    if (error || !Array.isArray(data) || !data.length) { render(true); return toast("Couldn't delete the tournament. Only its host or the club admin can."); }
     S.tour = null; S.screen = null; await Promise.all([loadTournaments(), loadLadder()]); location.hash = "#cups"; render(); toast("Tournament deleted");
   });
 }

@@ -252,6 +252,15 @@ h1,h2,h3{margin:0;font-weight:700;letter-spacing:-.02em;text-wrap:balance}
 .ppick button{display:flex;align-items:center;gap:12px;padding:12px;border-radius:20px;border:1px solid var(--edge);background:var(--glass);text-align:left;width:100%}
 .ppick button span{display:flex;flex-direction:column;gap:2px;min-width:0}
 .ppick button[aria-checked="true"]{border:1.5px solid var(--pb);background:rgba(232,236,243,.1)}
+/* selecting to delete */
+.selbar{position:fixed;z-index:30;left:50%;transform:translateX(-50%);bottom:calc(92px + env(safe-area-inset-bottom,0px));width:min(342px,calc(100% - 48px))}
+.selbar .btn{width:100%;box-shadow:0 12px 40px rgba(0,0,0,.5)}
+.btn.danger{background:var(--bad);color:#1a0703}
+.sheetcard.selecting,[data-tour][aria-pressed]{transition:border-color .2s,background-color .2s}
+.picked{border-color:var(--accent)!important;background:var(--accent-soft)}
+.tick{display:inline-grid;place-items:center;width:20px;height:20px;margin-right:8px;border-radius:6px;border:1.5px solid var(--edge-2);font-size:12px;font-weight:800;color:#fff;vertical-align:-4px}
+.picked .tick{background:var(--accent);border-color:var(--accent)}
+button.card:disabled{opacity:.45}
 </style>
 </head>
 <body>
