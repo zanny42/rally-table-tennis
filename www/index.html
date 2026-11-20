@@ -228,6 +228,30 @@ h1,h2,h3{margin:0;font-weight:700;letter-spacing:-.02em;text-wrap:balance}
 .pcard .score{display:inline-block}
 .fl1{animation:rFlash1 .5s ease-out forwards} .fl2{animation:rFlash2 .5s ease-out forwards}
 @media (prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important}}
+/* doubles */
+.kindpills button{height:44px;font-size:14px}
+.teams2{position:relative;display:flex;flex-direction:column;gap:10px}
+.tcard{display:flex;flex-direction:column;gap:10px;border-radius:24px}
+.tcard.ta{background:linear-gradient(135deg,rgba(255,90,31,.18),rgba(255,90,31,.05));border-color:rgba(255,90,31,.35)}
+.tlabel{font-size:12px;font-weight:700;letter-spacing:.08em;text-transform:uppercase}
+.ta .tlabel{color:#ffb08f} .tb .tlabel{color:var(--pb)}
+.tgrid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
+.tgrid .input{height:46px;font-size:16px}
+.dslot{display:flex;align-items:center;gap:10px;padding:8px 10px;border-radius:16px;background:rgba(0,0,0,.3);align-self:end;min-height:46px;box-sizing:border-box}
+.dslot b{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap} .dslot .small{display:block}
+.teams2 .vs{position:absolute;left:50%;top:50%;width:40px;height:40px;margin:-20px 0 0 -20px;border-radius:50%;background:var(--bg);border:1px solid var(--edge-2);display:grid;place-items:center;font-size:12px;font-weight:800;z-index:1}
+.pills.col{flex-direction:column;border-radius:20px;gap:2px} .pills.col button{border-radius:16px;overflow:hidden;text-overflow:ellipsis}
+.duo{display:flex;flex:none} .duo .av+.av{margin-left:-10px;box-shadow:0 0 0 2px var(--bg)}
+.serve.rcv{background:transparent;border-color:rgba(255,255,255,.3);padding-left:12px}
+.dserve{padding:12px;display:flex;flex-direction:column;gap:10px;border-radius:22px}
+.dserve svg{display:block;max-height:128px} .dserve svg text{font-family:inherit}
+.dorder{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px}
+.dorder span{padding:7px 3px;border-radius:12px;border:1px solid var(--edge);text-align:center;font-size:11px;color:var(--soft);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dorder span.now{background:var(--accent);border-color:var(--accent);color:#160a05;font-weight:700}
+.ppick{display:flex;flex-direction:column;gap:8px}
+.ppick button{display:flex;align-items:center;gap:12px;padding:12px;border-radius:20px;border:1px solid var(--edge);background:var(--glass);text-align:left;width:100%}
+.ppick button span{display:flex;flex-direction:column;gap:2px;min-width:0}
+.ppick button[aria-checked="true"]{border:1.5px solid var(--pb);background:rgba(232,236,243,.1)}
 </style>
 </head>
 <body>

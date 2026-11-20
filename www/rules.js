@@ -47,7 +47,53 @@
     return r;
   }
 
-  const fromRecord = r => ({ a: r.a, b: r.b, bestOf: r.bestOf, target: r.target, firstServer: r.firstServer, games: (r.g || []).map(s => [...s].map(Number)) });
+  const fromRecord = r => ({ a: r.a, b: r.b, bestOf: r.bestOf, target: r.target, firstServer: r.firstServer, games: (r.g || []).map(s => [...s].map(Number)),
+    kind: r.kind === "doubles" ? "doubles" : "singles", ap: r.ap, bp: r.bp, picks: r.picks || [] });
+
+  /* ---------- Doubles (ITTF) ----------
+     Players are [side, i]: side 0 = orange pair (ap), 1 = white pair (bp); i = 0 or 1 within the pair.
+     picks[g] = {s, r}: the server chosen by the serving pair in game g (r, the receiver, is only chosen in game 1;
+     later it is the player who served to the chosen server in the game before).
+     Serve goes round all four: server -> receiver -> server's partner -> receiver's partner, then again.
+     In the deciding game, when a pair first reaches 5 (10 in 21-point games), the receiving pair swap who receives,
+     which turns the rotation the other way round. */
+  const pairKey = (x, y) => [keyOf(x), keyOf(y)].sort().join(" & ");
+  const pairName = p => p[0] + " & " + p[1];
+  const bit = v => (v === 1 || v === "1") ? 1 : 0;
+  function doublesCycle(m, g) {
+    const picks = m.picks || [], p0 = picks[0] || {}, f = bit(m.firstServer), s0 = bit(p0.s), r0 = bit(p0.r);
+    let C = [[f, s0], [1 - f, r0], [f, 1 - s0], [1 - f, 1 - r0]];
+    for (let k = 1; k <= g; k++) {
+      const side = f ^ (k % 2), s = bit((picks[k] || {}).s), i = C.findIndex(c => c[0] === side && c[1] === s), P = C[(i + 3) % 4];
+      C = [[side, s], P, [side, 1 - s], [P[0], 1 - P[1]]];
+    }
+    return C;
+  }
+  function serveTurn(m, n) {
+    const per = m.target === 21 ? 5 : 2, ds = 2 * (m.target - 1);
+    return n < ds ? Math.floor(n / per) : Math.floor(ds / per) + (n - ds);
+  }
+  /* The point (0-based, within game g) from which the deciding-game receiving swap applies, or -1. */
+  function doublesSwapAt(m, g) {
+    if (g !== m.bestOf - 1) return -1;
+    const half = m.target === 21 ? 10 : 5, seq = (m.games && m.games[g]) || [];
+    let a = 0, b = 0;
+    for (let i = 0; i < seq.length; i++) { if (Number(seq[i])) b++; else a++; if (Math.max(a, b) >= half) return i + 1; }
+    return -1;
+  }
+  function doublesAt(m, g, n) {
+    const C = doublesCycle(m, g), k = serveTurn(m, n), sw = doublesSwapAt(m, g);
+    if (sw >= 0 && n >= sw) { const j = (((2 * serveTurn(m, sw) - k) % 4) + 4) % 4; return { srv: C[j], rcv: C[(j + 3) % 4], swapped: true }; }
+    return { srv: C[k % 4], rcv: C[(k + 1) % 4], swapped: false };
+  }
+  /* The serve order for the rest of game g, starting at point n: [[server, receiver] x 4]. */
+  function doublesOrder(m, g, n) { const out = []; let k = n; for (let i = 0; i < 4; i++) { const d = doublesAt(m, g, k); out.push([d.srv, d.rcv]); k = nextTurnStart(m, k); } return out; }
+  function nextTurnStart(m, n) { const t = serveTurn(m, n); let k = n + 1; while (serveTurn(m, k) === t) k++; return k; }
+  /* Who would receive if the serving pair in game g (g > 0) picks server s. */
+  function doublesReceiverFor(m, g, s) {
+    const prev = doublesCycle(m, g - 1), side = bit(m.firstServer) ^ (g % 2), i = prev.findIndex(c => c[0] === side && c[1] === s);
+    return prev[(i + 3) % 4];
+  }
 
   /* Elo ladder replayed from every match in time order. Start 1000, K=40 for a player's first 10 matches, then 24. */
   function computeBoard(list) {
@@ -76,7 +122,14 @@
   function validRecord(r) {
     try {
       if (!r || typeof r.a !== "string" || typeof r.b !== "string" || !r.a.trim() || !r.b.trim()) return false;
-      if (r.aKey !== keyOf(r.a) || r.bKey !== keyOf(r.b) || r.aKey === r.bKey) return false;
+      if (r.kind === "doubles") {
+        const ok = p => Array.isArray(p) && p.length === 2 && p.every(x => typeof x === "string" && x.trim());
+        if (!ok(r.ap) || !ok(r.bp) || r.a !== pairName(r.ap) || r.b !== pairName(r.bp)) return false;
+        if (r.aKey !== pairKey(r.ap[0], r.ap[1]) || r.bKey !== pairKey(r.bp[0], r.bp[1])) return false;
+        if (new Set(r.ap.concat(r.bp).map(keyOf)).size !== 4) return false;
+        if (r.picks != null && !(Array.isArray(r.picks) && r.picks.every(p => p && typeof p === "object"))) return false;
+      } else if (r.kind != null && r.kind !== "singles") return false;
+      else if (r.aKey !== keyOf(r.a) || r.bKey !== keyOf(r.b) || r.aKey === r.bKey) return false;
       if (![1, 3, 5, 7].includes(r.bestOf) || ![11, 21].includes(r.target) || ![0, 1].includes(r.firstServer)) return false;
       if (!Array.isArray(r.g) || !r.g.every(s => typeof s === "string" && /^[01]+$/.test(s))) return false;
       const s = summarize(fromRecord(r));
@@ -296,7 +349,7 @@
     return { desired: k.matches, complete: t.status === "done", champion: k.champion, koth: k };
   }
 
-  const api = { keyOf, gameScore, gameOver, serverAt, summarize, switchCount, stats, fromRecord, computeBoard, streakOf, validRecord, toMatch, applyPoint, undoPoint, initials,
+  const api = { pairKey, pairName, doublesCycle, doublesAt, doublesOrder, doublesSwapAt, doublesReceiverFor, keyOf, gameScore, gameOver, serverAt, summarize, switchCount, stats, fromRecord, computeBoard, streakOf, validRecord, toMatch, applyPoint, undoPoint, initials,
     prng, shuffled, pairUp, sameTeam, roundRobin, bracketDraw, bracketPlan, kothPlan, standings, tournamentPlan, matchWinnerTp };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
   else root.RallyRules = api;

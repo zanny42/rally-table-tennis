@@ -42,15 +42,17 @@ const S = {
   profiles: [], ladder: LS.get("rally.ladderCache", []), live: [], local: LS.get("rally.local", []),
   joined: new Set(LS.get("rally.joined", [])), tkeep: new Set(LS.get("rally.tkeep", [])),
   tournaments: [], tour: null, tdraft: null,
-  game: null, screen: null, report: null, draft: null, bump: null,
+  game: null, screen: null, report: null, draft: null, bump: null, ladderKind: "singles", pickAsked: "",
   pending: 0, booted: !sb, authMode: "signin", lastView: "", net: sb ? "loading" : "offline"
 };
 const uid = () => (S.session && S.session.user && S.session.user.id) || null;
 const myName = () => (S.me && S.me.name) || "";
 
 function fromRow(r) {
+  const dbl = r.kind === "doubles";
   return {
-    id: r.id, remote: true, a: r.a_name, b: r.b_name, aUser: r.a_user || null, bUser: r.b_user || null,
+    id: r.id, remote: true, a: dbl ? R.pairName([r.a_name, r.a2_name]) : r.a_name, b: dbl ? R.pairName([r.b_name, r.b2_name]) : r.b_name,
+    kind: dbl ? "doubles" : "singles", ap: dbl ? [r.a_name, r.a2_name] : null, bp: dbl ? [r.b_name, r.b2_name] : null, picks: dbl ? (r.picks || []) : [], aUser: r.a_user || null, bUser: r.b_user || null,
     bestOf: r.best_of, target: r.target, firstServer: r.first_server, keepers: r.keepers, code: r.join_code,
     games: r.games && r.games.length ? r.games.slice() : [""], status: r.status, version: r.version || 0, owner: r.owner,
     startedAt: Date.parse(r.started_at) || Date.now(), endedAt: r.ended_at ? Date.parse(r.ended_at) : null, flip: 0,
@@ -59,9 +61,19 @@ function fromRow(r) {
 }
 function toRecord(g) {
   const s = R.summarize(R.toMatch(g.games, g.bestOf, g.target, g.firstServer));
-  return { id: g.id, a: g.a, b: g.b, aKey: R.keyOf(g.a), bKey: R.keyOf(g.b), bestOf: g.bestOf, target: g.target, firstServer: g.firstServer,
+  const rec = { id: g.id, a: g.a, b: g.b, aKey: R.keyOf(g.a), bKey: R.keyOf(g.b), bestOf: g.bestOf, target: g.target, firstServer: g.firstServer,
     g: g.games.filter(x => x.length), winner: s.winner, gw: s.gw, startedAt: g.startedAt, endedAt: g.endedAt || Date.now() };
+  if (isDbl(g)) Object.assign(rec, { kind: "doubles", ap: g.ap.slice(), bp: g.bp.slice(), aKey: R.pairKey(g.ap[0], g.ap[1]), bKey: R.pairKey(g.bp[0], g.bp[1]), picks: (g.picks || []).slice() });
+  return rec;
 }
+/* ---------- singles and doubles ---------- */
+const isDbl = m => !!m && m.kind === "doubles";
+const kindOf = m => isDbl(m) ? "doubles" : "singles";
+const boardOf = kind => R.computeBoard(finished().filter(m => kindOf(m) === kind));
+/* Which side a player is on in a finished match: 0, 1, or -1 if they didn't play. */
+const sideOf = (m, key) => isDbl(m) ? ((m.ap || []).some(n => R.keyOf(n) === key) ? 0 : (m.bp || []).some(n => R.keyOf(n) === key) ? 1 : -1) : (m.aKey === key ? 0 : m.bKey === key ? 1 : -1);
+const pName = (g, p) => (p[0] ? g.bp : g.ap)[p[1]];
+const dMatch = g => Object.assign(R.toMatch(g.games, g.bestOf, g.target, g.firstServer), { kind: "doubles", picks: g.picks || [] });
 const finished = () => S.ladder.concat(S.local.map(m => Object.assign({ local: true }, m))).filter(m => m && m.aKey && m.g).sort((x, y) => x.endedAt - y.endedAt);
 function canScore(g) {
   if (!g.remote) return true;
@@ -316,7 +328,7 @@ function vAuth(app) {
 function vHome(app) {
   const me = myName(), key = me ? R.keyOf(me) : "";
   const fin = finished();
-  const mine = key ? fin.filter(m => m.aKey === key || m.bKey === key) : S.local.slice();
+  const mine = key ? fin.filter(m => sideOf(m, key) >= 0) : S.local.slice();
   const ws = weekStart(), labels = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
   const days = labels.map((l, i) => {
     const d0 = new Date(ws.getFullYear(), ws.getMonth(), ws.getDate() + i), d1 = new Date(ws.getFullYear(), ws.getMonth(), ws.getDate() + i + 1);
@@ -325,7 +337,7 @@ function vHome(app) {
   }).join("");
   const last7 = mine.slice(-7);
   const bars = last7.map((m, i) => {
-    const me0 = key ? (m.aKey === key ? 0 : 1) : 0, st = R.stats(R.fromRecord(m)), tot = st.pts[0] + st.pts[1];
+    const me0 = key ? sideOf(m, key) : 0, st = R.stats(R.fromRecord(m)), tot = st.pts[0] + st.pts[1];
     return { col: barCol(Math.round((tot ? st.pts[me0] / tot : 0) * 12), 12, "on", .25 + i * .07), who: R.initials(me0 ? m.a : m.b) };
   });
   const live = S.live.filter(m => m.status === "live");
@@ -356,14 +368,29 @@ function vHome(app) {
 
 function vNew(app) {
   const signed = !!uid();
-  const d = S.draft || (S.draft = { opp: null, oppGuest: "", guestOn: false, a: "", b: "", bestOf: 3, target: 11, serve: 0, keepers: "players" });
+  const d = S.draft || (S.draft = { kind: "singles", dn: ["", "", "", ""], ds: 0, dr: 0, opp: null, oppGuest: "", guestOn: false, a: "", b: "", bestOf: 3, target: 11, serve: 0, keepers: "players" });
   if (d.target !== 21) d.target = 11;
+  if (!Array.isArray(d.dn)) d.dn = ["", "", "", ""];
+  const dbl = d.kind === "doubles";
+  if (dbl && signed) d.dn[0] = myName();
   const others = S.profiles.filter(p => p.id !== uid());
   const opp = d.opp ? others.find(p => p.id === d.opp) : null;
   const aName = signed ? myName() : d.a, bName = signed ? (opp ? opp.name : d.oppGuest) : d.b;
-  app.innerHTML = `
-  <header class="row r-up"><button class="icon-btn" id="backBtn" aria-label="Back">${ICON.back}</button><h1 style="flex:1;text-align:center;font-size:19px;font-weight:600">New match</h1><span style="width:46px"></span></header>
-  ${signed ? `
+  const dn = d.dn;
+  const pairA = dn[0] || dn[1] ? (dn[0] || "?") + " & " + (dn[1] || "?") : "Team orange";
+  const pairB = dn[2] || dn[3] ? (dn[2] || "?") + " & " + (dn[3] || "?") : "Team white";
+  const slot = (i, label) => (signed && i === 0)
+    ? `<div class="dslot">${av(dn[0], "a sm")}<span style="min-width:0"><b>${esc(dn[0])}</b><span class="small muted">You</span></span></div>`
+    : `<div class="field"><label for="dn${i}">${label}</label><input class="input" id="dn${i}" maxlength="32" value="${esc(dn[i])}" placeholder="Name"${signed ? ' list="clubNames" autocomplete="off"' : ""}></div>`;
+  const sv = d.serve, srvNames = sv ? [dn[2], dn[3]] : [dn[0], dn[1]], rcvNames = sv ? [dn[0], dn[1]] : [dn[2], dn[3]];
+  const players = dbl ? `
+  <div class="r-up d1 teams2">
+    <div class="card pad tcard ta"><span class="between"><span class="tlabel">Team orange</span><span class="small muted">${sv ? "Receives first" : "Serves first"}</span></span><div class="tgrid">${slot(0, "Player 1")}${slot(1, signed ? "Your partner" : "Player 2")}</div></div>
+    <span class="vs">VS</span>
+    <div class="card pad tcard tb"><span class="between"><span class="tlabel">Team white</span><span class="small muted">${sv ? "Serves first" : "Receives first"}</span></span><div class="tgrid">${slot(2, "Player 1")}${slot(3, "Player 2")}</div></div>
+  </div>
+  ${signed ? `<datalist id="clubNames">${others.map(p => `<option value="${esc(p.name)}"></option>`).join("")}</datalist>` : ""}`
+  : signed ? `
   <div class="r-up d1" style="position:relative;display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:10px">
     <div class="card pad" style="display:flex;flex-direction:column;align-items:center;gap:8px;text-align:center">${av(aName, "a")}<b style="font-size:17px;max-width:100%;overflow:hidden;text-overflow:ellipsis">${esc(aName)}</b><span class="small muted">You · orange</span></div>
     <div class="card pad" style="display:flex;flex-direction:column;align-items:center;gap:8px;text-align:center">${av(bName || "?", "b")}<b style="font-size:17px;max-width:100%;overflow:hidden;text-overflow:ellipsis">${esc(bName || "Pick a player")}</b><span class="small muted">White</span></div>
@@ -378,32 +405,55 @@ function vNew(app) {
   <div class="card pad r-up d1" style="display:flex;flex-direction:column;gap:12px">
     <div class="field"><label for="gA">Orange player</label><input class="input" id="gA" maxlength="32" value="${esc(d.a)}" placeholder="Name"></div>
     <div class="field"><label for="gB">White player</label><input class="input" id="gB" maxlength="32" value="${esc(d.b)}" placeholder="Name"></div>
-  </div>`}
+  </div>`;
+  const picker = dbl ? `<div class="r-up d3" style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px">
+    <div class="field"><span class="small muted">Server</span><div class="pills col">${[0, 1].map(i => `<button type="button" data-ds="${i}" aria-pressed="${d.ds === i}">${esc(srvNames[i] || "Player " + (i + 1))}</button>`).join("")}</div></div>
+    <div class="field"><span class="small muted">Receiver</span><div class="pills col">${[0, 1].map(i => `<button type="button" data-dr="${i}" aria-pressed="${d.dr === i}">${esc(rcvNames[i] || "Player " + (i + 1))}</button>`).join("")}</div></div></div>
+  <p class="note r-up d3" style="margin-top:-6px">Rally works out the rest: serve goes round all four players, and the order swaps each game.</p>` : "";
+  app.innerHTML = `
+  <header class="row r-up"><button class="icon-btn" id="backBtn" aria-label="Back">${ICON.back}</button><h1 style="flex:1;text-align:center;font-size:19px;font-weight:600">New match</h1><span style="width:46px"></span></header>
+  <div class="pills kindpills r-up" role="group" aria-label="Match type"><button type="button" data-kind="singles" aria-pressed="${!dbl}">Singles · 1v1</button><button type="button" data-kind="doubles" aria-pressed="${dbl}">Doubles · 2v2</button></div>
+  ${players}
   <div class="field r-up d3"><span class="small muted">Format</span><div class="pills">${[1, 3, 5, 7].map(n => `<button type="button" data-best="${n}" aria-pressed="${d.bestOf === n}">${n === 1 ? "1 game" : "Best of " + n}</button>`).join("")}</div></div>
   <div class="field r-up d3"><span class="small muted">Points per game</span><div class="pills">${[11, 21].map(n => `<button type="button" data-target="${n}" aria-pressed="${d.target === n}">${n}</button>`).join("")}</div></div>
-  <div class="field r-up d3"><span class="small muted">First serve</span><div class="pills">
-    <button type="button" data-serve="0" aria-pressed="${d.serve === 0}">${esc(aName || "Orange")}</button><button type="button" data-serve="1" aria-pressed="${d.serve === 1}">${esc(bName || "White")}</button><button type="button" data-serve="toss">Toss</button></div></div>
+  <div class="field r-up d3"><span class="small muted">${dbl ? "Serving team" : "First serve"}</span><div class="pills">
+    <button type="button" data-serve="0" aria-pressed="${d.serve === 0}">${esc(dbl ? pairA : (aName || "Orange"))}</button><button type="button" data-serve="1" aria-pressed="${d.serve === 1}">${esc(dbl ? pairB : (bName || "White"))}</button><button type="button" data-serve="toss">Toss</button></div></div>
+  ${picker}
   ${signed ? `<fieldset class="card r-up d4" style="margin:0;padding:6px;display:flex;flex-direction:column;gap:2px"><legend class="small muted" style="padding:0 8px">Who can keep score</legend>
-    ${[["owner", "Only me"], ["players", "Both players"], ["club", "Anyone in the club"]].map(([v, l]) => `<label class="radio ${d.keepers === v ? "on" : ""}"><input type="radio" name="keepers" value="${v}" ${d.keepers === v ? "checked" : ""}>${l}</label>`).join("")}
+    ${[["owner", "Only me"], ["players", dbl ? "Me and a white player from the club" : "Both players"], ["club", "Anyone in the club"]].map(([v, l]) => `<label class="radio ${d.keepers === v ? "on" : ""}"><input type="radio" name="keepers" value="${v}" ${d.keepers === v ? "checked" : ""}>${l}</label>`).join("")}
     <p class="note" style="padding:4px 12px 8px">You also get a 4-digit code that lets anyone else join as scorekeeper.</p></fieldset>` : ""}
   <p class="err" id="newErr"></p>
-  <button class="btn r-up d5" id="startBtn">${ICON.play}Start match</button>`;
-  const keepInputs = () => { if ($("#oppGuest")) d.oppGuest = $("#oppGuest").value; if ($("#gA")) { d.a = $("#gA").value; d.b = $("#gB").value; } };
+  <button class="btn r-up d5" id="startBtn">${ICON.play}${dbl ? "Start doubles" : "Start match"}</button>`;
+  const keepInputs = () => {
+    if ($("#oppGuest")) d.oppGuest = $("#oppGuest").value;
+    if ($("#gA")) { d.a = $("#gA").value; d.b = $("#gB").value; }
+    for (let i = 0; i < 4; i++) if ($("#dn" + i)) d.dn[i] = $("#dn" + i).value;
+  };
   const again = () => { keepInputs(); render(true); };
   $("#backBtn").onclick = () => { S.screen = null; render(); };
+  app.querySelectorAll("[data-kind]").forEach(b => b.onclick = () => { d.kind = b.dataset.kind; again(); });
   app.querySelectorAll("[data-opp]").forEach(b => b.onclick = () => { d.opp = b.dataset.opp; d.guestOn = false; again(); });
   if ($("#guestChip")) $("#guestChip").onclick = () => { d.guestOn = !d.guestOn; if (d.guestOn) d.opp = null; again(); if ($("#oppGuest")) $("#oppGuest").focus(); };
   app.querySelectorAll("[data-best]").forEach(b => b.onclick = () => { d.bestOf = +b.dataset.best; again(); });
   app.querySelectorAll("[data-target]").forEach(b => b.onclick = () => { d.target = +b.dataset.target; again(); });
+  app.querySelectorAll("[data-ds]").forEach(b => b.onclick = () => { d.ds = +b.dataset.ds; again(); });
+  app.querySelectorAll("[data-dr]").forEach(b => b.onclick = () => { d.dr = +b.dataset.dr; again(); });
+  // a name typed in a team box updates the serve pickers once the box is left
+  for (let i = 0; i < 4; i++) if ($("#dn" + i)) $("#dn" + i).onchange = again;
   app.querySelectorAll("[data-serve]").forEach(b => b.onclick = () => {
-    if (b.dataset.serve === "toss") { d.serve = Math.random() < .5 ? 0 : 1; keepInputs(); toast("Coin toss: " + ((d.serve ? (signed ? bName : d.b) : (signed ? aName : d.a)) || (d.serve ? "White" : "Orange")) + " serves first"); }
-    else d.serve = +b.dataset.serve;
+    keepInputs();
+    if (b.dataset.serve === "toss") {
+      d.serve = Math.random() < .5 ? 0 : 1;
+      const who = dbl ? (d.serve ? "Team white" : "Team orange") : ((d.serve ? (signed ? bName : d.b) : (signed ? aName : d.a)) || (d.serve ? "White" : "Orange"));
+      toast("Coin toss: " + who + " serves first");
+    } else d.serve = +b.dataset.serve;
     again();
   });
   app.querySelectorAll('input[name="keepers"]').forEach(r => r.onchange = () => { d.keepers = r.value; again(); });
   $("#startBtn").onclick = async () => {
     keepInputs();
     const err = $("#newErr");
+    if (dbl) return startDoubles(d, err);
     const a = (signed ? myName() : d.a).trim(), b = (signed ? (opp ? opp.name : d.oppGuest) : d.b).trim();
     if (!a || !b) { err.textContent = signed ? "Pick an opponent or add a guest's name." : "Add a name for both players."; return; }
     if (R.keyOf(a) === R.keyOf(b)) { err.textContent = "The two players need different names."; return; }
@@ -417,6 +467,26 @@ function vNew(app) {
     if (error || !data) { err.textContent = "Couldn't start the match. Check your connection and try again."; return; }
     S.game = fromRow(data); S.live.unshift(fromRow(data)); S.screen = null; render();
   };
+}
+async function startDoubles(d, err) {
+  const n = d.dn.map(x => String(x || "").trim().replace(/\s+/g, " "));
+  if (n.some(x => !x)) { err.textContent = "Add a name for all four players."; return; }
+  if (new Set(n.map(R.keyOf)).size < 4) { err.textContent = "All four players need different names."; return; }
+  const picks = [{ s: d.ds ? 1 : 0, r: d.dr ? 1 : 0 }];
+  if (!uid()) {
+    S.game = { id: newId(), remote: false, kind: "doubles", ap: [n[0], n[1]], bp: [n[2], n[3]], a: R.pairName([n[0], n[1]]), b: R.pairName([n[2], n[3]]), picks,
+      bestOf: d.bestOf, target: d.target, firstServer: d.serve, games: [""], status: "live", startedAt: Date.now(), endedAt: null, version: 0, flip: 0 };
+    saveLocalGame(); S.screen = null; render(); return;
+  }
+  const prof = name => S.profiles.find(p => p.id !== uid() && R.keyOf(p.name) === R.keyOf(name));
+  const opp = prof(n[2]) || prof(n[3]);
+  const btn = $("#startBtn"); btn.disabled = true;
+  const row = { kind: "doubles", a_name: n[0], a2_name: n[1], b_name: n[2], b2_name: n[3], picks, a_user: uid(), b_user: opp ? opp.id : null, best_of: d.bestOf, target: d.target, first_server: d.serve, keepers: d.keepers };
+  let res = await sb.from("live_matches").insert(row).select().single();
+  if (res.error && res.error.code === "23505") res = await sb.from("live_matches").insert(row).select().single();
+  btn.disabled = false;
+  if (res.error || !res.data) { err.textContent = "Couldn't start the match. Check your connection and try again."; return; }
+  S.game = fromRow(res.data); S.live.unshift(fromRow(res.data)); S.screen = null; render();
 }
 
 function vGame(app) {
@@ -433,12 +503,19 @@ function vGame(app) {
   if (fx.id !== g.id) fx = { id: g.id };
   const bd = [badge(0), badge(1)], be = [enter("b0", bd[0]), enter("b1", bd[1])], de = enter("deuce", deuce ? "1" : "");
   const name = i => i ? g.b : g.a;
+  const dbl = isDbl(g), dm = dbl ? dMatch(g) : null, dd = dbl && !s.over ? R.doublesAt(dm, s.g, n) : null;
+  const per = g.target === 21 ? 5 : 2, inDeuce = n >= 2 * (g.target - 1);
+  const serveTxt = inDeuce ? "Serving" : "Serve " + ((n % per) + 1) + " of " + per;
+  const head = i => dbl
+    ? `<span class="duo">${av((i ? g.bp : g.ap)[0], i ? "b sm" : "a sm")}${av((i ? g.bp : g.ap)[1], i ? "b sm" : "a sm")}</span>`
+    : av(name(i), i ? "b sm" : "a sm");
   const card = i => `<button class="pcard p${i} ${srv === i ? "serving" : ""}" data-p="${i}" ${can && !s.over ? "" : "disabled"} aria-label="Point to ${esc(name(i))}, now ${s.cur[i]}">
       ${srv === i ? '<span class="halo"></span>' : ""}<span class="flash ${bump && bump.p === i ? "fl" + alt : ""}"${hit(i)}></span>
-      <span class="row">${av(name(i), i ? "b sm" : "a sm")}<span style="flex:1;font-size:18px;font-weight:600;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(name(i))}</span>
+      <span class="row">${head(i)}<span style="flex:1;font-size:18px;font-weight:600;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(name(i))}</span>
         <span class="pips" aria-label="${s.gw[i]} games won">${Array.from({ length: s.need }, (_, k) => `<i class="${k < s.gw[i] ? "on" : ""}"></i>`).join("")}</span></span>
       <span class="foot"><span style="display:flex;flex-direction:column;gap:8px;padding-bottom:12px">
-        ${srv === i ? `<span class="serve"><span class="ball"></span>${n >= 2 * (g.target - 1) ? "Serving" : "Serve " + ((n % (g.target === 21 ? 5 : 2)) + 1) + " of " + (g.target === 21 ? 5 : 2)}</span>` : ""}
+        ${srv === i ? `<span class="serve"><span class="ball"></span>${dd ? esc(pName(g, dd.srv)) + " · " + serveTxt.toLowerCase() : serveTxt}</span>` : ""}
+        ${dd && dd.rcv[0] === i ? `<span class="serve rcv">${esc(pName(g, dd.rcv))} receiving</span>` : ""}
         ${bd[i] ? `<span class="badge${be[i].c}"${be[i].s}>${bd[i]}</span>` : ""}</span>
         <span class="score ${bump && bump.p === i ? "pop" + alt : ""}"${hit(i)}>${s.cur[i]}</span></span>
     </button>`;
@@ -454,7 +531,7 @@ function vGame(app) {
   ${card(order[0])}
   <div class="net">${deuce ? `<span class="deuce${de.c}"${de.s}>Deuce · serve alternates</span>` : `<span>Games ${s.gw[0]}–${s.gw[1]} · <span id="gtimer">${CLOCK}</span></span>`}</div>
   ${card(order[1])}
-  <div class="card wave"><span class="between small"><span class="muted">Momentum this game</span><span style="font-weight:600">${runText}</span></span>${wave(leadSeries([h || ""]).length ? leadSeries([h]) : [], 324, 62, "gwave", "Lead in this game, point by point")}</div>
+  ${dbl ? serveCard(g, dm, s, n, order, can) : `<div class="card wave"><span class="between small"><span class="muted">Momentum this game</span><span style="font-weight:600">${runText}</span></span>${wave(leadSeries([h || ""]).length ? leadSeries([h]) : [], 324, 62, "gwave", "Lead in this game, point by point")}</div>`}
   <div class="controls"><button class="icon-btn" id="swapBtn" aria-label="Switch ends on screen">${ICON.swap}</button>
     <button class="main" id="undoBtn" aria-label="Undo last point" ${canUndo ? "" : "disabled"}>${ICON.undo}</button>
     <button class="icon-btn" id="optBtn2" aria-label="Match options">${ICON.more}</button></div>`;
@@ -464,7 +541,7 @@ function vGame(app) {
      and its fade-in plays once per finished match. */
   const over = $("#overRoot");
   const inner = s.over ? `<span class="glow big" style="position:absolute"></span><span style="font-size:14px;color:var(--accent-ink);font-weight:600">Match over</span>
-    <h2>${esc(name(s.winner))} wins ${Math.max(...s.gw)}–${Math.min(...s.gw)}</h2>
+    <h2>${esc(name(s.winner))} ${isDbl(g) ? "win" : "wins"} ${Math.max(...s.gw)}–${Math.min(...s.gw)}</h2>
     <button class="btn" id="reportBtn">See the match report</button>
     ${g.tournamentId ? `<button class="btn ghost" id="toTour">Back to the tournament</button>` : ""}
     ${canUndo ? `<button class="btn ghost" id="overUndo">Undo last point</button>` : ""}
@@ -480,6 +557,12 @@ function vGame(app) {
   if ($("#overUndo")) $("#overUndo").onclick = undoLast;
   if ($("#toTour")) $("#toTour").onclick = () => { const tid = g.tournamentId; S.game = null; openTour(tid); };
   if ($("#homeBtn")) $("#homeBtn").onclick = () => { S.game = null; render(); };
+  if ($("#pickBtn")) $("#pickBtn").onclick = () => openPick(s.g);
+  if ($("#guideBtn")) $("#guideBtn").onclick = openGuide;
+  // a new doubles game: the pair now serving chooses their server (asked once per game; "Who serves?" reopens it)
+  if (dbl && can && !s.over && s.g > 0 && n === 0 && !(g.picks || [])[s.g] && S.pickAsked !== g.id + ":" + s.g && !$("#sheetRoot").firstChild) {
+    S.pickAsked = g.id + ":" + s.g; openPick(s.g);
+  }
   if (!s.over) timerT = setInterval(() => { const t = $("#gtimer"); if (t && S.game) t.textContent = fmtDur(Date.now() - S.game.startedAt); }, 1000);
 }
 
@@ -490,6 +573,102 @@ function enter(k, v) {
   const ago = Date.now() - fx[k].t;
   return ago < 400 ? { c: " enter", s: ` style="animation-delay:-${ago}ms"` } : { c: "", s: "" };
 }
+/* In the deciding game the players change ends when someone first reaches 5 (10 in 21-point games);
+   in doubles the receiving pair also swap who receives. */
+function decidingNotice(g) {
+  const gi = g.games.length - 1, seq = g.games[gi] || "";
+  if (gi !== g.bestOf - 1 || !seq.length) return;
+  const [a, b] = R.gameScore([...seq].map(Number)), half = g.target === 21 ? 10 : 5;
+  // only on the point that first takes a side to `half`: the scorer just reached it and the other side hasn't
+  const scorer = +seq.slice(-1), mine = scorer ? b : a, theirs = scorer ? a : b;
+  if (mine !== half || theirs >= half) return;
+  if (isDbl(g)) { const dd = R.doublesAt(dMatch(g), gi, seq.length); toast(`Change ends. The receiving pair swap: ${pName(g, dd.rcv)} receives now.`); }
+  else toast("Change ends for the deciding game.");
+}
+/* ---------- doubles: serve card, choosing the server, the rules ---------- */
+const DCOL = [["#ff5a1f", "#ff8a55"], ["#e8ecf3", "#c3cad6"]];
+function serveCard(g, dm, s, n, order, can) {
+  if (s.over) return "";
+  const dd = R.doublesAt(dm, s.g, n), L = order[0];
+  const pos = p => {
+    // the left end of the drawing is the team shown on top. Each player stands on their own right half:
+    // at the left end that's the bottom half, at the right end the top half.
+    const left = p[0] === L, srvSide = dd.srv[0], isSrv = p[0] === dd.srv[0] && p[1] === dd.srv[1], isRcv = p[0] === dd.rcv[0] && p[1] === dd.rcv[1];
+    const onRight = p[0] === srvSide ? isSrv : isRcv; // server and receiver stand in their right halves, partners opposite
+    const top = left ? !onRight : onRight;
+    return { x: left ? 14 : 320, y: top ? 38 : 90 };
+  };
+  const dot = p => { const q = pos(p), on = (p[0] === dd.srv[0] && p[1] === dd.srv[1]) || (p[0] === dd.rcv[0] && p[1] === dd.rcv[1]);
+    return `<circle cx="${q.x}" cy="${q.y}" r="${on ? 12 : 10}" fill="${DCOL[p[0]][p[1]]}" fill-opacity="${on ? 1 : .4}"/><text x="${q.x}" y="${q.y + 3.5}" text-anchor="middle" font-size="9" font-weight="800" fill="${on && p[0] === 0 ? "#160a05" : on ? "#09090b" : "#f5f5f7"}">${esc(R.initials(pName(g, p)))}</text>`; };
+  const a = pos(dd.srv), b = pos(dd.rcv), ax = a.x < 160 ? 40 : 294, bx = b.x < 160 ? 40 : 294;
+  const per = g.target === 21 ? 5 : 2, inDeuce = n >= 2 * (g.target - 1), left = per - (n % per);
+  const ord = R.doublesOrder(dm, s.g, n);
+  const next = inDeuce ? "From deuce the serve changes every point" : `Serve passes to ${esc(pName(g, ord[1][0]))} after ${left} more point${left === 1 ? "" : "s"}`;
+  const players = [[0, 0], [0, 1], [1, 0], [1, 1]];
+  return `<section class="card dserve" aria-label="Doubles serve">
+    <svg viewBox="0 0 334 128" width="100%" role="img" aria-label="${esc(pName(g, dd.srv))} serves diagonally to ${esc(pName(g, dd.rcv))}">
+      <rect x="28" y="14" width="278" height="100" rx="8" fill="#13305c" stroke="#e8ecf3" stroke-opacity=".85" stroke-width="2"/>
+      <line x1="28" y1="64" x2="306" y2="64" stroke="#e8ecf3" stroke-opacity=".7" stroke-width="1.5"/>
+      <line x1="167" y1="6" x2="167" y2="122" stroke="#f5f5f7" stroke-width="3"/>
+      <rect x="${a.x < 160 ? 28 : 167}" y="${a.y < 64 ? 14 : 64}" width="139" height="50" fill="${DCOL[dd.srv[0]][0]}" fill-opacity=".18"/>
+      <rect x="${b.x < 160 ? 28 : 167}" y="${b.y < 64 ? 14 : 64}" width="139" height="50" fill="${DCOL[dd.rcv[0]][0]}" fill-opacity=".14"/>
+      <path d="M${ax} ${a.y < 64 ? 34 : 96} Q 167 ${a.y < 64 ? 96 : 34} ${bx} ${b.y < 64 ? 34 : 96}" fill="none" stroke="#ffb04a" stroke-width="3" stroke-dasharray="2 7" stroke-linecap="round"/>
+      ${players.map(dot).join("")}
+    </svg>
+    <div class="dorder" aria-label="Serve order">${ord.map((o, i) => `<span class="${i ? "" : "now"}">${esc(pName(g, o[0]))} → ${esc(pName(g, o[1]))}</span>`).join("")}</div>
+    <span class="between small"><span class="muted">${dd.swapped ? "Receivers swapped for the deciding game · " : ""}${next}</span>
+      <span class="row" style="gap:6px;flex:none">${can && n === 0 ? `<button class="btn small ghost" id="pickBtn">Who serves?</button>` : ""}<button class="icon-btn" id="guideBtn" style="width:34px;height:34px" aria-label="How doubles serve works"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M9.6 9.3a2.5 2.5 0 014.8 1c0 1.7-2.4 2.2-2.4 3.7M12 17.2v.1"/></svg></button></span></span>
+  </section>`;
+}
+
+/* The pair serving game gi chooses their server; in game 1 the receivers choose who receives too. */
+function openPick(gi, sel) {
+  const g = S.game; if (!g || !isDbl(g)) return;
+  const dm = dMatch(g), side = (g.firstServer ^ (gi % 2)) & 1, cur = (g.picks || [])[gi] || {};
+  sel = sel || { s: cur.s ? 1 : 0, r: cur.r ? 1 : 0 };
+  const srvPair = side ? g.bp : g.ap, rcvPair = side ? g.ap : g.bp, team = side ? "Team white" : "Team orange";
+  const recvFor = s => gi === 0 ? [1 - side, sel.r] : R.doublesReceiverFor(dm, gi, s);
+  const trial = Object.assign({}, dm, { picks: (g.picks || []).slice(0, gi).concat([{ s: sel.s, r: sel.r }]), games: dm.games.slice(0, gi).concat([[]]) });
+  const ord = R.doublesOrder(trial, gi, 0);
+  const ps = gi > 0 ? R.gameScore(dm.games[gi - 1] || []) : null;
+  const prev = ps ? `GAME ${gi} TO ${ps[0] > ps[1] ? "TEAM ORANGE" : "TEAM WHITE"} · ${Math.max(...ps)}–${Math.min(...ps)}` : "";
+  openSheet(`<div class="between"><span style="font-size:12px;font-weight:700;letter-spacing:.08em;color:var(--accent-ink)">${prev ? esc(prev) : "FIRST GAME"}</span><button class="icon-btn" data-close aria-label="Close">${ICON.close}</button></div>
+    <h2 style="font-size:24px">Game ${gi + 1}: ${team} serves</h2>
+    <p class="soft" style="margin:0">${gi === 0 ? "Pick who serves first, and who on the other team receives." : "Teams switch ends. Pick the server; Rally sets the receiver from last game."}</p>
+    <div class="ppick" role="radiogroup" aria-label="Who serves">${[0, 1].map(i => { const rv = recvFor(i); return `<button type="button" role="radio" aria-checked="${sel.s === i}" data-ps="${i}">${av(srvPair[i], side ? "b" : "a")}<span><b>${esc(srvPair[i])} serves</b><span class="small muted">${gi === 0 ? "" : "to " + esc(pName(g, rv)) + ", who served to " + esc(srvPair[i]) + " last game"}</span></span></button>`; }).join("")}</div>
+    ${gi === 0 ? `<div class="ppick" role="radiogroup" aria-label="Who receives">${[0, 1].map(i => `<button type="button" role="radio" aria-checked="${sel.r === i}" data-pr="${i}">${av(rcvPair[i], side ? "a" : "b")}<span><b>${esc(rcvPair[i])} receives</b></span></button>`).join("")}</div>` : ""}
+    <div class="card pad" style="display:flex;flex-direction:column;gap:8px"><span class="small muted">Serve order this game</span><div class="dorder">${ord.map((o, i) => `<span class="${i ? "" : "now"}">${esc(pName(g, o[0]))} → ${esc(pName(g, o[1]))}</span>`).join("")}</div></div>
+    <p class="err" id="pickErr"></p>
+    <button class="btn" id="pickSave">${gi === 0 && g.games.join("") === "" ? "Save" : "Start game " + (gi + 1)}</button>`,
+  close => {
+    document.querySelectorAll("[data-ps]").forEach(b => b.onclick = () => openPick(gi, { s: +b.dataset.ps, r: sel.r }));
+    document.querySelectorAll("[data-pr]").forEach(b => b.onclick = () => openPick(gi, { s: sel.s, r: +b.dataset.pr }));
+    $("#pickSave").onclick = async () => {
+      const gg = S.game; if (!gg || gg.id !== g.id) return close();
+      if (!gg.remote) {
+        const picks = (gg.picks || []).slice(0, gi); while (picks.length < gi) picks.push({ s: 0, r: 0 });
+        picks.push({ s: sel.s, r: sel.r }); gg.picks = picks; saveLocalGame(); close(); return render(true);
+      }
+      $("#pickSave").disabled = true;
+      const { data, error } = await sb.rpc("set_pick", { p_id: gg.id, p_game: gi, p_server: sel.s, p_receiver: sel.r });
+      if (error || !data) { $("#pickSave").disabled = false; $("#pickErr").textContent = error && /first point/.test(error.message || "") ? "This game has already started." : "Couldn't save. Check your connection."; return; }
+      if (S.game && S.game.id === gg.id) S.game = Object.assign(fromRow(data), { flip: gg.flip });
+      close(); render(true);
+    };
+  });
+}
+function openGuide() {
+  const rules = [
+    ["Always diagonal", "Serve from your right half into the receiver's right half. A serve into the wrong half is a point to the receivers."],
+    ["All four take turns", "Whoever just received serves next, to the last server's partner: A1 → B1 → A2 → B2, then round again."],
+    ["When the serve changes", "Every 2 points, or every 5 in 21-point games. From deuce it changes every point, in the same order."],
+    ["Each new game", "Ends switch. The pair that received first now serves first and picks a server, who serves to whoever served to them last game."],
+    ["Deciding game", "When a pair reaches 5 (10 in 21-point games), ends switch and the receiving pair swap who receives. Rally tells you when."]
+  ];
+  openSheet(`<div class="between"><h2 style="font-size:22px">How doubles serve works</h2><button class="icon-btn" data-close aria-label="Close">${ICON.close}</button></div>
+    ${rules.map(([t, d], i) => `<div class="card pad" style="display:flex;flex-direction:column;gap:4px"><b>${i + 1} · ${t}</b><span class="small soft">${d}</span></div>`).join("")}`);
+}
+
 function saveLocalGame() { if (S.game && !S.game.remote) LS.set("rally.localGame", S.game); }
 
 async function point(p) {
@@ -503,6 +682,7 @@ async function point(p) {
   if (r.done) { g.status = "done"; g.endedAt = Date.now(); }
   buzz(r.done ? [30, 40, 30] : 12);
   if (!r.done && g.games.length > gamesBefore) { const [a, b] = R.gameScore([...g.games[gamesBefore - 1]].map(Number)); toast(`${p ? g.b : g.a} takes game ${gamesBefore}, ${Math.max(a, b)}–${Math.min(a, b)}. Change ends.`); }
+  if (!r.done) decidingNotice(g);
   S.bump = { p, n: Date.now() };
   if (!g.remote) {
     if (r.done) { S.local.push(toRecord(g)); LS.set("rally.local", S.local); LS.del("rally.localGame"); } else saveLocalGame();
@@ -552,8 +732,10 @@ function openGameOptions() {
   const owner = !g.remote || g.owner === uid();
   openSheet(`<div class="between"><h2 style="font-size:22px">Match options</h2><button class="icon-btn" data-close aria-label="Close">${ICON.close}</button></div>
     ${g.remote && canScore(g) ? `<div class="card pad" style="display:flex;flex-direction:column;gap:8px;align-items:center"><span class="small muted">Scorekeeper join code</span><span class="code" id="codeTxt">${esc(g.code)}</span><button class="btn small ghost" id="copyCode">Copy code</button><p class="note" style="text-align:center">Anyone signed in to Rally can enter this code on their home screen to keep score with you.</p></div>` : ""}
+    ${isDbl(g) ? `<button class="btn ghost" id="optGuide">How doubles serve works</button>` : ""}
     ${owner ? `<button class="btn ghost" id="delMatch" style="color:var(--bad)">${g.remote ? "End and delete this match" : "Discard this match"}</button>` : ""}`,
   close => {
+    if ($("#optGuide")) $("#optGuide").onclick = () => { close(); openGuide(); };
     if ($("#copyCode")) $("#copyCode").onclick = async () => { try { await navigator.clipboard.writeText(g.code); toast("Code copied"); } catch (e) { const r = document.createRange(); r.selectNodeContents($("#codeTxt")); const sel = getSelection(); sel.removeAllRanges(); sel.addRange(r); toast("Code selected. Copy it from here."); } };
     let armed = false;
     if ($("#delMatch")) $("#delMatch").onclick = async e => {
@@ -591,7 +773,7 @@ function openJoin() {
 /* ---------- report ---------- */
 function vReport(app) {
   const rec = S.report, m = R.fromRecord(rec), st = R.stats(m);
-  const board = R.computeBoard(finished()), d = board.deltas.get(rec.id) || [0, 0];
+  const dbl = isDbl(rec), board = boardOf(kindOf(rec)), d = board.deltas.get(rec.id) || [0, 0];
   const w = rec.winner, wn = w ? rec.b : rec.a, wKey = w ? rec.bKey : rec.aKey, wp = board.byKey.get(wKey);
   const scores = (rec.g || []).map(s => R.gameScore([...s].map(Number)));
   const top = Math.max(11, ...scores.flat());
@@ -599,11 +781,11 @@ function vReport(app) {
   if (!paint(app, `
   <header class="row"><button class="icon-btn" id="closeRep" aria-label="Close">${ICON.close}</button><span style="flex:1;text-align:center;font-size:17px;font-weight:600">Match report</span><span style="width:46px"></span></header>
   <div class="r-up" style="padding:6px 4px 2px"><span style="font-size:14px;color:#ffd2bf">${fmtDate(rec.endedAt)} · ${fmtDur(rec.endedAt - rec.startedAt)}</span>
-    <h1 style="font-size:clamp(42px,14vw,56px);line-height:.95;letter-spacing:-.03em">${esc(wn)} wins<br>${Math.max(...rec.gw)}–${Math.min(...rec.gw)}</h1>
+    <h1 style="font-size:clamp(${dbl ? "34px,10vw,46px" : "42px,14vw,56px"});line-height:.95;letter-spacing:-.03em">${esc(wn)} ${dbl ? "win" : "wins"}<br>${Math.max(...rec.gw)}–${Math.min(...rec.gw)}</h1>
     <span class="soft">against ${esc(w ? rec.a : rec.b)}</span></div>
   <div class="r-up d1" style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px">
-    <div class="card pad"><span class="small soft">${esc(wn)}'s rating</span><div class="num" style="margin-top:12px;font-size:38px">${wp ? wp.r : "–"}<small> / <span class="${d[w] >= 0 ? "up" : "down"}">${sign(d[w])}</span></small></div></div>
-    <div class="card pad"><span class="small soft">Ladder</span><div class="num" style="margin-top:12px;font-size:38px">${wp ? ordinal(wp.rank) : "–"}<small> / ${board.players.length}</small></div></div>
+    <div class="card pad"><span class="small soft">${dbl ? "Pair rating" : esc(wn) + "'s rating"}</span><div class="num" style="margin-top:12px;font-size:38px">${wp ? wp.r : "–"}<small> / <span class="${d[w] >= 0 ? "up" : "down"}">${sign(d[w])}</span></small></div></div>
+    <div class="card pad"><span class="small soft">${dbl ? "Doubles ladder" : "Ladder"}</span><div class="num" style="margin-top:12px;font-size:38px">${wp ? ordinal(wp.rank) : "–"}<small> / ${board.players.length}</small></div></div>
   </div>
   <div class="card pad r-up d2" style="display:flex;flex-direction:column;gap:10px">
     <div class="between"><span style="font-size:16px;font-weight:600">Points per game</span><span class="row small soft" style="gap:12px"><span class="row" style="gap:5px"><i style="width:8px;height:8px;border-radius:2px;background:var(--accent)"></i>${esc(rec.a)}</span><span class="row" style="gap:5px"><i style="width:8px;height:8px;border-radius:2px;background:var(--pb)"></i>${esc(rec.b)}</span></span></div>
@@ -619,8 +801,14 @@ function vReport(app) {
   ${canDel ? `<button class="link" id="delRec" style="align-self:center;color:var(--bad)">Delete this match</button>` : ""}`)) return;
   $("#closeRep").onclick = () => { S.screen = S.tour && rec.tournament ? "tour" : null; S.report = null; render(); };
   $("#repPdf").onclick = () => exportHistoryPdf([rec], `${rec.a} v ${rec.b}`);
-  $("#toLadder").onclick = () => { S.screen = null; S.report = null; location.hash = "#ladder"; render(); };
+  $("#toLadder").onclick = () => { S.ladderKind = kindOf(rec); S.screen = null; S.report = null; location.hash = "#ladder"; render(); };
   $("#rematch").onclick = () => {
+    if (dbl) {
+      const mine = uid() && rec.bp.some(n => R.keyOf(n) === R.keyOf(myName()));
+      const dn = mine ? rec.bp.concat(rec.ap) : rec.ap.concat(rec.bp);
+      S.draft = { kind: "doubles", dn, opp: null, oppGuest: "", guestOn: false, a: "", b: "", bestOf: rec.bestOf, target: rec.target, serve: (rec.firstServer ? 0 : 1) ^ (mine ? 1 : 0), ds: 0, dr: 0, keepers: "players" };
+      S.screen = "new"; S.report = null; return render();
+    }
     const opp = uid() ? S.profiles.find(p => p.id !== uid() && R.keyOf(p.name) === (R.keyOf(myName()) === rec.aKey ? rec.bKey : rec.aKey)) : null;
     S.draft = { opp: opp ? opp.id : null, oppGuest: opp ? "" : (R.keyOf(myName()) === rec.aKey ? rec.b : rec.a), guestOn: !opp, a: rec.a, b: rec.b, bestOf: rec.bestOf, serve: rec.firstServer ? 0 : 1, keepers: "players" };
     S.screen = "new"; S.report = null; render();
@@ -644,25 +832,27 @@ const ordinal = n => n + (["th", "st", "nd", "rd"][(n % 100 - 20) % 10] || ["th"
 
 /* ---------- ladder, sheets, you ---------- */
 function vLadder(app) {
-  const fin = finished(), board = R.computeBoard(fin), top = board.players[0], rest = board.players.slice(1);
+  const all = finished(), kind = S.ladderKind === "doubles" ? "doubles" : "singles", fin = all.filter(m => kindOf(m) === kind), board = R.computeBoard(fin), top = board.players[0], rest = board.players.slice(1);
   const ws = weekStart(), labels = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
-  const counts = labels.map((_, i) => { const d0 = new Date(ws.getFullYear(), ws.getMonth(), ws.getDate() + i), d1 = new Date(ws.getFullYear(), ws.getMonth(), ws.getDate() + i + 1); return fin.filter(m => m.endedAt >= d0 && m.endedAt < d1).length; });
+  const counts = labels.map((_, i) => { const d0 = new Date(ws.getFullYear(), ws.getMonth(), ws.getDate() + i), d1 = new Date(ws.getFullYear(), ws.getMonth(), ws.getDate() + i + 1); return all.filter(m => m.endedAt >= d0 && m.endedAt < d1).length; });
   const maxC = Math.max(10, ...counts);
   if (!paint(app, `
   <header class="between r-up"><h1 style="font-size:28px">Ladder</h1><span class="small muted">${fin.length} match${fin.length === 1 ? "" : "es"} · Elo</span></header>
+  <div class="pills r-up" role="group" aria-label="Ladder"><button type="button" data-lk="singles" aria-pressed="${kind === "singles"}">Singles</button><button type="button" data-lk="doubles" aria-pressed="${kind === "doubles"}">Doubles pairs</button></div>
   ${top ? `<button class="card pad r-up d1" data-k="${esc(top.key)}" style="position:relative;overflow:hidden;display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:12px;border-color:rgba(255,90,31,.45);text-align:left;width:100%;border-radius:26px">
     <span style="position:absolute;left:-60px;bottom:-120px;width:280px;height:260px;border-radius:50%;background:radial-gradient(closest-side,rgba(255,90,31,.45),rgba(255,90,31,0))"></span>
     <span style="position:relative;display:flex;flex-direction:column;gap:6px;min-width:0"><span class="small" style="color:#ffd2bf">Top of the ladder</span><span style="font-size:26px;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(top.name)}</span><span class="num" style="font-size:44px">${top.r}<small> / rating</small></span></span>
     <span style="position:relative">${ring(104, 7, top.w / Math.max(1, top.w + top.l), "#ff5a1f", `<span style="text-align:center;line-height:1.1;position:relative"><b style="display:block;font-size:24px;font-weight:600">${Math.round(top.w / Math.max(1, top.w + top.l) * 100)}%</b><span style="font-size:11px;color:var(--soft)">win rate</span></span>`)}</span>
-  </button>` : `<div class="card empty r-up d1"><b>The ladder is empty</b>Finish a match to put the first name on it.</div>`}
+  </button>` : `<div class="card empty r-up d1"><b>The ladder is empty</b>${kind === "doubles" ? "Finish a doubles match to put the first pair on it." : "Finish a match to put the first name on it."}</div>`}
   <div class="card pad r-up d2" style="display:flex;flex-direction:column;gap:10px"><span style="font-size:16px;font-weight:600">Club matches this week</span>
     <div class="bars" style="grid-template-columns:repeat(7,minmax(0,1fr));gap:8px">${counts.map((c, i) => barCol(Math.round(c / maxC * 10), 10, "on", .25 + i * .07)).join("")}</div>
     <div class="axis" style="grid-template-columns:repeat(7,minmax(0,1fr));gap:8px">${labels.map(l => `<span>${l}</span>`).join("")}</div></div>
   <div class="r-up d3" style="display:flex;flex-direction:column;gap:8px">${rest.map(p => `<button class="prow" data-k="${esc(p.key)}"><span class="rk">${p.rank}</span>${av(p.name, "sm")}<span style="display:flex;flex-direction:column;gap:4px;min-width:0"><span style="font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(p.name)}</span><span class="dots">${p.res.slice(-5).map(r => `<i class="${r ? "w" : "l"}"></i>`).join("")}</span></span><span style="text-align:right;line-height:1.15"><span style="display:block;font-size:20px;font-weight:500">${p.r}</span><span class="small ${p.lastDelta >= 0 ? "up" : "down"}">${sign(p.lastDelta)}</span></span></button>`).join("")}</div>`)) return;
   app.querySelectorAll("[data-k]").forEach(b => b.onclick = () => openPlayer(b.dataset.k));
+  app.querySelectorAll("[data-lk]").forEach(b => b.onclick = () => { S.ladderKind = b.dataset.lk; render(true); });
 }
 function openPlayer(k) {
-  const fin = finished(), { byKey, deltas } = R.computeBoard(fin), p = byKey.get(k); if (!p) return;
+  const kind = S.ladderKind === "doubles" ? "doubles" : "singles", fin = finished().filter(m => kindOf(m) === kind), { byKey, deltas } = R.computeBoard(fin), p = byKey.get(k); if (!p) return;
   const opp = [...p.opp.values()].sort((a, b) => (b.w + b.l) - (a.w + a.l));
   const recent = fin.filter(m => m.aKey === k || m.bKey === k).slice(-5).reverse();
   openSheet(`<div class="between"><div class="row">${av(p.name, "a")}<div><h2 style="font-size:22px">${esc(p.name)}</h2><span class="small muted">${ordinal(p.rank)} · ${p.w}–${p.l}</span></div></div><button class="icon-btn" data-close aria-label="Close">${ICON.close}</button></div>
@@ -681,7 +871,7 @@ function vSheets(app) {
   if ($("#sheetPdf")) $("#sheetPdf").onclick = () => exportHistoryPdf(finished(), "Match history");
 }
 function vYou(app) {
-  const me = myName(), key = R.keyOf(me || ""), p = key ? R.computeBoard(finished()).byKey.get(key) : null;
+  const me = myName(), key = R.keyOf(me || ""), p = key ? boardOf("singles").byKey.get(key) : null;
   if (!paint(app, uid() ? `
   <header class="row r-up">${av(me, "a")}<div style="flex:1;min-width:0"><h1 style="font-size:24px;overflow:hidden;text-overflow:ellipsis">${esc(me)}</h1><span class="small muted">${esc(S.session.user.email || "")}</span></div></header>
   <div class="r-up d1" style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px">
@@ -912,7 +1102,7 @@ const tidyName = s => String(s || "").replace(/\s+/g, " ").trim();
 function tourOrder(d) {
   const list = d.players.map((p, i) => ({ name: p.name, team: d.teams.includes(p.team) ? p.team : "", userId: p.userId || null, i }));
   if (d.mode === "bracket" && d.draw === "seeded") {
-    const board = R.computeBoard(finished()).byKey, rating = p => (board.get(R.keyOf(p.name)) || { r: 1000 }).r;
+    const board = boardOf("singles").byKey, rating = p => (board.get(R.keyOf(p.name)) || { r: 1000 }).r;
     const nth = new Map(), count = new Map();
     list.forEach(p => { const k = rating(p) + "|" + p.team; nth.set(p, p.team ? (count.get(k) || 0) : 0); count.set(k, (count.get(k) || 0) + 1); });
     const tix = p => p.team ? d.teams.indexOf(p.team) : d.teams.length;
@@ -1169,10 +1359,10 @@ function pdfTable(doc, opts) {
 }
 function pdfHeading(doc, y, text) { doc.setFont("helvetica", "bold"); doc.setFontSize(12); doc.setTextColor(24, 24, 28); doc.text(pdfText(text), 36, y); return y + 8; }
 function matchRows(list) {
-  const board = R.computeBoard(finished());
+  const boards = { singles: boardOf("singles"), doubles: boardOf("doubles") };
   return list.map(m => {
-    const st = R.stats(R.fromRecord(m)), d = board.deltas.get(m.id), scores = (m.g || []).map(s => R.gameScore([...s].map(Number)).join("-"));
-    return [fmtDate(m.endedAt), m.tournament || "", m.a + " v " + m.b, m.gw[0] + "-" + m.gw[1], m.winner ? m.b : m.a, scores.join(", "),
+    const st = R.stats(R.fromRecord(m)), d = boards[kindOf(m)].deltas.get(m.id), scores = (m.g || []).map(s => R.gameScore([...s].map(Number)).join("-"));
+    return [fmtDate(m.endedAt), m.tournament || (isDbl(m) ? "Doubles" : ""), m.a + " v " + m.b, m.gw[0] + "-" + m.gw[1], m.winner ? m.b : m.a, scores.join(", "),
       st.pts[0] + "-" + st.pts[1], st.run[0] + "-" + st.run[1], pct(st.srvWon[0], st.srvTot[0]) + " / " + pct(st.srvWon[1], st.srvTot[1]),
       fmtDur(m.endedAt - m.startedAt), d ? (d[0] >= 0 ? "+" : "") + d[0] + " / " + (d[1] >= 0 ? "+" : "") + d[1] : ""];
   });
