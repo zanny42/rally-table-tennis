@@ -69,15 +69,19 @@ function makeBackend() {
   B.isTKeeper = isTKeeper;
   const publish = m => {
     const gw = gamesWon(m.games, m.target), t = m.tournament_id ? db.tournaments.find(x => x.id === m.tournament_id) : null;
-    const data = { a: m.a_name.trim(), b: m.b_name.trim(), aKey: m.a_name.trim().toLowerCase().replace(/\s+/g, " "), bKey: m.b_name.trim().toLowerCase().replace(/\s+/g, " "),
+    const k = n => n.trim().toLowerCase().replace(/\s+/g, " "), dbl = m.kind === "doubles";
+    const pk = (x, y) => [k(x), k(y)].sort().join(" & ");
+    const data = { a: dbl ? m.a_name.trim() + " & " + m.a2_name.trim() : m.a_name.trim(), b: dbl ? m.b_name.trim() + " & " + m.b2_name.trim() : m.b_name.trim(),
+      aKey: dbl ? pk(m.a_name, m.a2_name) : k(m.a_name), bKey: dbl ? pk(m.b_name, m.b2_name) : k(m.b_name),
       bestOf: m.best_of, target: m.target, firstServer: m.first_server, g: m.games.filter(x => x !== ""), winner: gw[0] > gw[1] ? 0 : 1, gw,
       startedAt: Date.parse(m.started_at), endedAt: Date.parse(m.ended_at || new Date().toISOString()) };
     if (t) { data.tournament = t.name; data.tournamentId = t.id; }
+    if (dbl) Object.assign(data, { kind: "doubles", ap: [m.a_name.trim(), m.a2_name.trim()], bp: [m.b_name.trim(), m.b2_name.trim()], picks: clone(m.picks || []) });
     db.matches = db.matches.filter(x => x.id !== m.id);
     db.matches.push({ id: m.id, data, ended_at: data.endedAt, by: m.owner });
   };
   const defaults = {
-    live_matches: uid => ({ id: uuid(), owner: uid, games: [""], status: "live", version: 0, join_code: String(code++), started_at: new Date().toISOString(), updated_at: new Date().toISOString(), ended_at: null, tournament_id: null, round: null, slot: null, a_tp: null, b_tp: null, a_user: null, b_user: null, keepers: "players", first_server: 0, target: 11, best_of: 3 }),
+    live_matches: uid => ({ id: uuid(), owner: uid, games: [""], status: "live", version: 0, join_code: String(code++), started_at: new Date().toISOString(), updated_at: new Date().toISOString(), ended_at: null, tournament_id: null, round: null, slot: null, a_tp: null, b_tp: null, a_user: null, b_user: null, keepers: "players", first_server: 0, target: 11, best_of: 3, kind: "singles", a2_name: null, b2_name: null, picks: [] }),
     tournaments: uid => ({ id: uuid(), owner: uid, seed: 987654321, join_code: String(code++), status: "live", champion: null, created_at: new Date().toISOString(), ended_at: null, cross_team: false, draw: "random", best_of: 1, target: 11 }),
     tournament_players: () => ({ id: uuid(), joined_round: 0, user_id: null, team: "", position: 0 }),
     profiles: () => ({}), matches: () => ({}), match_keepers: () => ({}), tournament_keepers: () => ({})
@@ -186,6 +190,18 @@ function makeBackend() {
           if (m.status === "done") db.matches = db.matches.filter(x => x.id !== m.id);
           Object.assign(m, { games: g, status: "live", ended_at: null, updated_at: new Date().toISOString(), version: m.version + 1 });
         }
+        emit("live_matches", "UPDATE", m, { id: m.id });
+        return { data: clone(m), error: null };
+      }
+      if (fn === "set_pick") {
+        const m = db.live_matches.find(r => r.id === args.p_id);
+        if (!m) return { data: null, error: { code: "P0001", message: "match not found" } };
+        if (!canScore(me, m)) return { data: null, error: { code: "42501", message: "not allowed to score this match" } };
+        if (m.kind !== "doubles" || m.status !== "live") return { data: null, error: { code: "P0001", message: "not a live doubles match" } };
+        if (args.p_game !== m.games.length - 1 || m.games[m.games.length - 1] !== "") return { data: null, error: { code: "P0001", message: "the server is chosen before the first point of a game" } };
+        const p = []; for (let i = 0; i < args.p_game; i++) p.push((m.picks || [])[i] || { s: 0, r: 0 });
+        p.push({ s: args.p_server, r: args.p_receiver });
+        Object.assign(m, { picks: p, updated_at: new Date().toISOString(), version: m.version + 1 });
         emit("live_matches", "UPDATE", m, { id: m.id });
         return { data: clone(m), error: null };
       }
@@ -1254,5 +1270,151 @@ test("tournament: a finished tournament match opens its report and closing retur
   assert.match(text(w), /Part of Report back/);
   click(w, "#closeRep"); await tick();
   assert.equal(view(w), "tour", where(w));
+  healthy(w);
+});
+
+/* ================================================================
+   DOUBLES
+   ================================================================ */
+const servingName = w => { const s = $(w, ".pcard .serve:not(.rcv)"); return s ? s.textContent.split(" · ")[0].trim() : ""; };
+const receivingName = w => { const s = $(w, ".pcard .serve.rcv"); return s ? s.textContent.replace(/receiving/, "").trim() : ""; };
+const sheetText = w => w.document.getElementById("sheetRoot").textContent.replace(/\s+/g, " ");
+function typeIn(w, id, v) { const e = $(w, "#" + id); assert.ok(e, `expected #${id} ${where(w)}`); e.value = v; e.dispatchEvent(new w.Event("change")); }
+async function clubDoubles(w, names, o = {}) {
+  click(w, "#newBtn"); await tick();
+  click(w, '[data-kind="doubles"]');
+  names.forEach((n, i) => typeIn(w, "dn" + (i + 1), n));
+  if (o.ds) click(w, '[data-ds="1"]');
+  if (o.dr) click(w, '[data-dr="1"]');
+  click(w, "#startBtn"); await wait(200);
+  assert.equal(view(w), "game", where(w));
+  return w.__rally.S.game.id;
+}
+
+test("doubles: two phones score a club doubles match together and agree on every server", async () => {
+  const { B, maya, theo } = club();
+  const a = await signedPhone(B, maya), b = await signedPhone(B, theo);
+  const id = await clubDoubles(a, ["Priya", "Theo", "Sam"], { ds: 1 });
+  const row = () => B.db.live_matches.find(m => m.id === id);
+  assert.equal(row().kind, "doubles"); assert.equal(row().b_user, theo.id);
+  await wait(200);
+  assert.match(text(b), /Maya & Priya v Theo & Sam/, "Theo sees the doubles match live");
+  click(b, `[data-live="${id}"]`); await tick();
+  assert.match(text(b), /Both players scoring/);
+  assert.equal(servingName(a), "Priya"); assert.equal(receivingName(a), "Theo");
+  assert.equal(servingName(b), "Priya"); assert.equal(receivingName(b), "Theo");
+  // score from both phones; after every point both show the same server and receiver
+  const seq = [0, 1, 1, 0, 0, 0, 1, 0, 1, 0];
+  for (let i = 0; i < seq.length; i++) {
+    tap(i % 2 ? b : a, seq[i]); await wait(150);
+    assert.equal(servingName(a), servingName(b), "same server after point " + (i + 1));
+    assert.equal(receivingName(a), receivingName(b), "same receiver after point " + (i + 1));
+  }
+  // 10 points = 5 turns done (Priya>Theo, Theo>Maya, Maya>Sam, Sam>Priya, Priya>Theo): turn 6 is Theo>Maya
+  assert.equal(servingName(a), "Theo"); assert.equal(receivingName(a), "Maya");
+  while (row().games.length === 1) { tap(a, 0); await wait(80); }
+  await wait(300);
+  assert.match(sheetText(a), /Game 2: Team white serves/, "the picker opens on Maya's phone");
+  assert.match(sheetText(b), /Game 2: Team white serves/, "and on Theo's");
+  click(b, '[data-ps="1"]'); click(b, "#pickSave"); await wait(300);
+  assert.equal(JSON.stringify(row().picks[1]), JSON.stringify({ s: 1, r: 0 }));
+  assert.equal(sheetText(a), "", "Maya's out-of-date picker closes");
+  assert.match($(a, "#toast").textContent, /Sam serves to .* \(chosen on another phone\)/);
+  assert.equal(servingName(a), "Sam"); assert.equal(servingName(b), "Sam");
+  assert.equal(receivingName(a), receivingName(b));
+  for (let i = 0; i < 11; i++) { tap(i % 2 ? a : b, 1); await wait(60); }
+  await wait(300);
+  // game 3 is the decider: orange serves; Maya picks herself
+  assert.match(sheetText(a), /Game 3: Team orange serves/);
+  click(a, '[data-ps="0"]'); click(a, "#pickSave"); await wait(300);
+  assert.equal(servingName(b), "Maya");
+  for (let i = 0; i < 4; i++) { tap(a, 0); await wait(60); }
+  const before = receivingName(b);
+  tap(a, 0); await wait(200);
+  assert.match($(a, "#toast").textContent, /receiving pair swap/);
+  assert.notEqual(receivingName(b), before, "the receivers swapped on Theo's phone too");
+  assert.equal(receivingName(a), receivingName(b));
+  while (row().status !== "done") { tap(b, 0); await wait(60); }
+  await wait(400);
+  assert.match($(a, ".overlay").textContent, /Maya & Priya win 2–1/);
+  assert.match($(b, ".overlay").textContent, /Maya & Priya win 2–1/);
+  const rec = B.db.matches.find(m => m.id === id).data;
+  assert.equal(rec.kind, "doubles"); assert.equal(rec.picks.length, 3);
+  click(b, "#homeBtn"); await tick();
+  await go(b, "#ladder");
+  assert.doesNotMatch(text(b), /Maya & Priya/, "singles ladder has no pairs");
+  click(b, '[data-lk="doubles"]'); await tick();
+  assert.match(text(b), /Maya & Priya\s*1020/);
+  assert.match(text(b), /Theo & Sam\s*980/);
+  healthy(a, b);
+});
+
+test("doubles: a club member who is not a scorekeeper watches and cannot pick the server", async () => {
+  const { B, maya, priya } = club();
+  const a = await signedPhone(B, maya), p = await signedPhone(B, priya);
+  const id = await clubDoubles(a, ["Priya", "Theo", "Sam"]);
+  await wait(200);
+  click(p, `[data-live="${id}"]`); await tick();
+  assert.match(text(p), /Watching/);
+  assert.equal($(p, "#pickBtn"), null);
+  while (B.db.live_matches.find(m => m.id === id).games.length === 1) { tap(a, 0); await wait(60); }
+  await wait(300);
+  assert.equal(sheetText(p), "", "no picker for a watcher");
+  assert.match(sheetText(a), /Game 2/);
+  healthy(a, p);
+});
+
+test("doubles: guest best of 5 to 21 points, decider swap at 10, report, PDF and rematch", async () => {
+  const w = boot(null, { pdf: true }); await tick(); click(w, "#guestBtn"); await tick();
+  click(w, "#newBtn"); await tick(); click(w, '[data-kind="doubles"]');
+  ["Ali", "Sam", "Jo", "Kai"].forEach((n, i) => typeIn(w, "dn" + i, n));
+  click(w, '[data-best="5"]'); click(w, '[data-target="21"]');
+  click(w, "#startBtn"); await tick();
+  assert.match($(w, ".pcard .serve").textContent, /Ali · serve 1 of 5/);
+  for (let i = 0; i < 4; i++) tap(w, 0);
+  assert.match($(w, ".pcard .serve").textContent, /Ali · serve 5 of 5/);
+  tap(w, 0);
+  assert.equal(servingName(w), "Jo", "21-point games pass the serve after 5");
+  const win = (p, n = 21) => { for (let i = 0; i < n; i++) tap(w, p); };
+  const dismiss = () => { const x = w.document.querySelector("#sheetRoot [data-close]"); if (x) x.click(); };
+  win(0, 16);
+  for (const p of [1, 0, 1]) { dismiss(); win(p); }
+  assert.match(text(w), /Game 5/);
+  dismiss();
+  for (let i = 0; i < 9; i++) tap(w, 1);
+  const before = receivingName(w);
+  tap(w, 1);
+  assert.match($(w, "#toast").textContent, /receiving pair swap/, "21-point decider swaps at 10");
+  assert.notEqual(receivingName(w), before);
+  win(1, 11);
+  assert.match($(w, ".overlay").textContent, /Jo & Kai win 3–2/);
+  click(w, "#reportBtn"); await tick();
+  assert.match(text(w), /Jo & Kai win/);
+  assert.match(text(w), /Doubles ladder/);
+  click(w, "#repPdf"); await wait(100);
+  assert.equal(w.__pdfs.length, 1, "PDF made: " + $(w, "#toast").textContent);
+  assert.ok(w.__pdfs[0].pdf.includes("Doubles"), "PDF labels the doubles match");
+  click(w, "#rematch"); await tick();
+  assert.equal(view(w), "new");
+  assert.equal(JSON.stringify(["dn0", "dn1", "dn2", "dn3"].map(id => $(w, "#" + id).value)), JSON.stringify(["Ali", "Sam", "Jo", "Kai"]));
+  assert.equal($(w, '[data-kind="doubles"]').getAttribute("aria-pressed"), "true");
+  healthy(w);
+});
+
+test("doubles: undo across a game boundary keeps the chosen server for the next game", async () => {
+  const w = await guestPhone();
+  click(w, "#newBtn"); await tick(); click(w, '[data-kind="doubles"]');
+  ["Ali", "Sam", "Jo", "Kai"].forEach((n, i) => typeIn(w, "dn" + i, n));
+  click(w, "#startBtn"); await tick();
+  for (let i = 0; i < 11; i++) tap(w, 0);
+  click(w, '[data-ps="1"]'); click(w, "#pickSave"); await tick();
+  assert.equal(servingName(w), "Kai");
+  click(w, "#undoBtn");
+  assert.match(text(w), /Game 1/);
+  assert.equal(servingName(w), "Jo", "back in game 1 at 10-0 (turn 6: Jo to Sam) the rotation is game 1's"); assert.equal(receivingName(w), "Sam");
+  tap(w, 0);
+  assert.match(text(w), /Game 2/);
+  assert.equal(sheetText(w), "", "the server for game 2 was already chosen");
+  assert.equal(servingName(w), "Kai");
   healthy(w);
 });

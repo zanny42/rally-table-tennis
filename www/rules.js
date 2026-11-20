@@ -159,7 +159,8 @@
     return g;
   }
 
-  const initials = n => String(n || "?").trim().split(/\s+/).map(w => w[0] || "").slice(0, 2).join("").toUpperCase() || "?";
+  /* "Maya Lee" -> "ML"; a pair "Jo & Kai" -> "JK" (the "&" is not a name) */
+  const initials = n => String(n || "?").trim().split(/\s+/).filter(w => w && w !== "&").map(w => w[0]).slice(0, 2).join("").toUpperCase() || "?";
 
   /* ---------- Tournaments ----------
      t: {mode: "koth"|"round_robin"|"bracket", crossTeam, draw: "random"|"seeded", seed, status}

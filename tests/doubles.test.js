@@ -64,6 +64,12 @@ test("doubles: deciding game, the receivers swap when a pair reaches 5", () => {
   assert.equal(R.doublesSwapAt(M({ games: [[0, 0, 0, 0, 0]] }), 0), -1);
 });
 
+test("doubles: a pair's initials skip the &", () => {
+  assert.equal(R.initials("Jo & Kai"), "JK");
+  assert.equal(R.initials("Maya Lee"), "ML");
+  assert.equal(R.initials("&"), "?");
+});
+
 test("doubles: serve order lists the next four turns", () => {
   const m = M();
   assert.deepEqual(R.doublesOrder(m, 0, 3).map(([s, r]) => tag(s) + ">" + tag(r)), ["B0>A1", "A1>B1", "B1>A0", "A0>B0"]);

@@ -157,6 +157,13 @@ function onLiveChange(p) {
     S.game = Object.assign(row, { flip: prev.flip });
     const before = prev.games.join("").length, after = row.games.join("").length;
     if (after > before) { const last = row.games.filter(x => x).pop(); S.bump = { p: +last.slice(-1), n: Date.now() }; } else S.bump = null;
+    // another scorekeeper chose the server: close this phone's now out-of-date picker
+    const sr = $("#sheetRoot");
+    if (isDbl(row) && sr.dataset.pick != null && JSON.stringify(prev.picks || []) !== JSON.stringify(row.picks || [])) {
+      const gi = +sr.dataset.pick, d = R.doublesAt(dMatch(row), gi, 0);
+      sr.innerHTML = ""; delete sr.dataset.pick;
+      toast(pName(row, d.srv) + " serves to " + pName(row, d.rcv) + " (chosen on another phone)");
+    }
   }
   if (row.status === "done") loadLadder().then(() => render(true));
   if (row.tournamentId && S.tour && S.tour.t.id === row.tournamentId) {
@@ -641,6 +648,7 @@ function openPick(gi, sel) {
     <p class="err" id="pickErr"></p>
     <button class="btn" id="pickSave">${gi === 0 && g.games.join("") === "" ? "Save" : "Start game " + (gi + 1)}</button>`,
   close => {
+    $("#sheetRoot").dataset.pick = gi;
     document.querySelectorAll("[data-ps]").forEach(b => b.onclick = () => openPick(gi, { s: +b.dataset.ps, r: sel.r }));
     document.querySelectorAll("[data-pr]").forEach(b => b.onclick = () => openPick(gi, { s: sel.s, r: +b.dataset.pr }));
     $("#pickSave").onclick = async () => {
@@ -721,8 +729,9 @@ async function undoLast() {
 /* ---------- sheets ---------- */
 function openSheet(html, mount) {
   const root = $("#sheetRoot");
+  delete root.dataset.pick;
   root.innerHTML = `<div class="backdrop" id="bd"><div class="sheet" role="dialog" aria-modal="true">${html}</div></div>`;
-  const close = () => { root.innerHTML = ""; };
+  const close = () => { root.innerHTML = ""; delete root.dataset.pick; };
   $("#bd").onclick = e => { if (e.target.id === "bd") close(); };
   root.querySelectorAll("[data-close]").forEach(b => b.onclick = close);
   mount && mount(close);
